@@ -8,11 +8,13 @@
 //! channels, timing, budgets -- belongs to higher-level tools
 //! (CLBOSS, sling, an operator at the CLI).
 
+mod plan;
+
 use anyhow::anyhow;
 use cln_plugin::options::DefaultIntegerConfigOption;
 use cln_plugin::{messages, Builder, Error, Plugin};
 use serde::Deserialize;
-use serde_json::json;
+use std::path::PathBuf;
 
 /// Learned constraints in the persistent xrebalance layer expire
 /// after this many seconds.  Applied lazily before each request (and
@@ -31,12 +33,18 @@ const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
 /// caller's label.
 const TOPIC_PART: &str = "xrebalance_part";
 
-#[derive(Clone, Default)]
-struct State;
+#[derive(Clone)]
+pub struct State {
+    /// Path to the lightningd RPC socket (plugins start with CWD =
+    /// lightning-dir, so the relative rpc_file works as-is).
+    pub rpc_path: PathBuf,
+    /// Seconds until learned constraints expire.
+    pub constraint_age: u64,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct XRebalanceParams {
+pub struct XRebalanceParams {
     /// Channels to drain (our outgoing scids).
     sources: Vec<String>,
     /// Channels to fill (our incoming scids).
@@ -62,7 +70,7 @@ struct XRebalanceParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    if let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
+    let Some(configured) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPT_CONSTRAINT_AGE)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
         .rpcmethod(
@@ -72,13 +80,18 @@ async fn main() -> Result<(), Error> {
             xrebalance,
         )
         .dynamic()
-        .start(State)
+        .configure()
         .await?
-    {
-        plugin.join().await
-    } else {
-        Ok(())
-    }
+    else {
+        return Ok(());
+    };
+    let state = State {
+        rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
+        constraint_age: u64::try_from(configured.option(&OPT_CONSTRAINT_AGE)?)
+            .map_err(|_| anyhow!("xrebalance-constraint-age must be positive"))?,
+    };
+    let plugin = configured.start(state).await?;
+    plugin.join().await
 }
 
 async fn xrebalance(
@@ -101,16 +114,14 @@ async fn xrebalance(
     if parsed.maxparts == Some(0) {
         return Err(anyhow!("maxparts must be at least 1"));
     }
+    if parsed.amount_msat == 0 {
+        return Err(anyhow!("amount_msat must be positive"));
+    }
 
-    // Scaffold: the interface is wired end-to-end; the split layer,
-    // getroutes planning, and execution land next.
-    Ok(json!({
-        "status": "scaffold",
-        "message": "interface accepted; planning and execution not yet implemented",
-        "label": parsed.label,
-        "sources": parsed.sources,
-        "destinations": parsed.destinations,
-        "amount_msat": parsed.amount_msat,
-        "dryrun": parsed.dryrun.unwrap_or(false),
-    }))
+    if !parsed.dryrun.unwrap_or(false) {
+        return Err(anyhow!(
+            "execution not yet implemented; pass dryrun=true to plan routes"
+        ));
+    }
+    plan::plan(_plugin.state(), &parsed).await
 }
