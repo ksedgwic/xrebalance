@@ -1,0 +1,16 @@
+[package]
+name = "xrebalance"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Core Lightning plugin: circular self-rebalance executor built on askrene"
+repository = "https://github.com/ksedgwic/xrebalance"
+
+[dependencies]
+anyhow = "1"
+cln-plugin = "0.7"
+cln-rpc = "0.7"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
