@@ -4,10 +4,6 @@ on:
     push:
         branches:
             - master
-        paths-ignore:
-            - 'README.md'
-            - 'LICENSE'
-            - '.gitignore'
     pull_request:
     workflow_dispatch:
 
