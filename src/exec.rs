@@ -157,9 +157,27 @@ impl Part {
     }
 }
 
-/// One best-effort inform-channel write into the persistent layer.
-async fn inform(rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: &str) {
-    if let Err(e) = rpc
+/// One best-effort inform-channel write into the persistent layer,
+/// coalesced: a bound already accepted this bucket and not tightened
+/// by this observation is dropped (coalesce.rs).
+async fn inform(
+    state: &State,
+    rpc: &mut ClnRpc,
+    scidd: &str,
+    amount_msat: u64,
+    kind: &str,
+) {
+    let key = format!("{scidd}|{kind}");
+    let is_lower_bound = kind != "constrained";
+    let Some(bucket) = state
+        .coalescer
+        .lock()
+        .expect("coalescer lock")
+        .check(&key, now_secs(), amount_msat, is_lower_bound)
+    else {
+        return;
+    };
+    match rpc
         .call_raw::<Value, Value>(
             "askrene-inform-channel",
             &json!({
@@ -171,7 +189,12 @@ async fn inform(rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: &str) {
         )
         .await
     {
-        log::debug!("inform {kind} {scidd}: {e}");
+        Ok(_) => state
+            .coalescer
+            .lock()
+            .expect("coalescer lock")
+            .record(&key, bucket, amount_msat),
+        Err(e) => log::debug!("inform {kind} {scidd}: {e}"),
     }
 }
 
@@ -198,8 +221,11 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
     match fail_data {
         None => {
             for hop in part.hops.iter().filter(|h| !h.ours) {
-                inform(&mut rpc, &hop.scidd, hop.amount_msat, "unconstrained")
-                    .await;
+                inform(
+                    state, &mut rpc, &hop.scidd, hop.amount_msat,
+                    "unconstrained",
+                )
+                .await;
             }
         }
         Some(data) => {
@@ -224,13 +250,19 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 return;
             };
             for hop in part.hops[..erring_idx].iter().filter(|h| !h.ours) {
-                inform(&mut rpc, &hop.scidd, hop.amount_msat, "unconstrained")
-                    .await;
+                inform(
+                    state, &mut rpc, &hop.scidd, hop.amount_msat,
+                    "unconstrained",
+                )
+                .await;
             }
             let erring = &part.hops[erring_idx];
             if !erring.ours {
-                inform(&mut rpc, &erring.scidd, erring.amount_msat, "constrained")
-                    .await;
+                inform(
+                    state, &mut rpc, &erring.scidd, erring.amount_msat,
+                    "constrained",
+                )
+                .await;
             }
         }
     }

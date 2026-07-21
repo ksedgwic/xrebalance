@@ -7,6 +7,7 @@
 //! at what price; xrebalance handles the how.  Strategy -- choosing
 //! channels, timing, budgets -- belongs to higher-level tools.
 
+mod coalesce;
 mod exec;
 mod plan;
 
@@ -76,6 +77,8 @@ pub struct State {
     pub part_wait_secs: u64,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Suppresses redundant persistent-layer informs (coalesce.rs).
+    pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,13 +132,17 @@ async fn main() -> Result<(), Error> {
     else {
         return Ok(());
     };
+    let constraint_age = u64::try_from(configured.option(&OPT_CONSTRAINT_AGE)?)
+        .map_err(|_| anyhow!("xrebalance-constraint-age must be positive"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
-        constraint_age: u64::try_from(configured.option(&OPT_CONSTRAINT_AGE)?)
-            .map_err(|_| anyhow!("xrebalance-constraint-age must be positive"))?,
+        constraint_age,
         part_wait_secs: u64::try_from(configured.option(&OPT_PART_WAIT)?)
             .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?,
         claims: Arc::new(Mutex::new(HashMap::new())),
+        coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
+            constraint_age,
+        ))),
     };
     let plugin = configured.start(state).await?;
     plugin.join().await
