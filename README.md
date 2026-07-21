@@ -67,6 +67,16 @@ Options:
 The plugin is dynamic: it can be started, stopped, and restarted
 without restarting `lightningd`.
 
+## Testing
+
+Integration tests drive the real plugin binary against regtest nodes
+via [pyln-testing](https://pypi.org/project/pyln-testing/); nothing
+is mocked.  `lightningd` (v26.06+) and `bitcoind` must be on PATH:
+
+    cargo build
+    cd tests
+    LIGHTNINGD=/path/to/lightning/lightningd/lightningd uv run pytest
+
 ## License
 
 MIT

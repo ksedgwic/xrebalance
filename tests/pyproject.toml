@@ -1,0 +1,9 @@
+[project]
+name = "xrebalance-tests"
+version = "0.1.0"
+description = "Integration tests for the xrebalance plugin (pyln-testing)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyln-testing>=26.6,<27",
+    "pytest-timeout>=2",
+]
