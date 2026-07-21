@@ -108,3 +108,67 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
         == before2 + 50000)
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'zero-wait'")
+
+
+def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
+                          part_subscriber):
+    """A network hop without the liquidity the plan assumes.
+
+    askrene knows a network channel's capacity but not its balance
+    split, so after l2 pays away most of its l2 -> l3 balance the
+    plan still routes through it; the part then fails there with
+    temporary_channel_failure.  The failure must surface as a failed
+    part, a terminal notification, and a constrained record on the
+    erring direction in the persistent layer -- and the next solve
+    must refuse the now-known-infeasible route.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    # Drain l2 -> l3: after this l2 can forward well under the
+    # 200_000_000 msat the rebalance will ask of it.
+    l2.pay(l3, 900_000_000)
+    wait_for(lambda: only_one(
+        l2.rpc.listpeerchannels(l3.info['id'])['channels'])['spendable_msat']
+        < 150_000_000)
+
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=200_000_000, maxfee_msat=1_000_000,
+                            label='starved')
+    assert res['status'] == 'executed', res
+    part = only_one(res['parts'])
+    assert part['status'] == 'failed', res
+    assert 'WIRE_TEMPORARY_CHANNEL_FAILURE' in part['detail'], res
+    assert res['delivered_msat'] == 0, res
+    assert res['pending_msat'] == 0, res
+
+    l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
+
+    # Failure feedback: the erring direction (l2 -> l3) now carries a
+    # constrained record in the persistent layer.
+    chan23 = only_one([c for c in l1.rpc.listchannels(
+        source=l2.info['id'])['channels']
+        if c['destination'] == l3.info['id']])
+    scidd23 = f"{chan23['short_channel_id']}/{chan23['direction']}"
+    xlayer = only_one(l1.rpc.askrene_listlayers('xrebalance')['layers'])
+    cons = [c for c in xlayer['constraints']
+            if c['short_channel_id_dir'] == scidd23
+            and 'maximum_msat' in c]
+    assert cons, xlayer
+    assert min(c['maximum_msat'] for c in cons) < 210_000_000, cons
+
+    # The learned constraint reaches the next solve: the only route
+    # is now known infeasible at this amount, so nothing is planned.
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=200_000_000, maxfee_msat=1_000_000,
+                            dryrun=True)
+    assert res['status'] == 'planned', res
+    assert res['delivered_msat'] == 0, res
+    assert res['routes'] == [], res
