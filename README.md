@@ -1,11 +1,10 @@
 # xrebalance
 
-A Core Lightning plugin that moves funds between a node's own
-channels via a circular self-payment, using
+A Core Lightning plugin that moves funds between a node's own channels
+via independent circular self-payments, using
 [askrene](https://docs.corelightning.org/reference/lightning-getroutes)
-for route computation — on **unmodified** Core Lightning.  The
-circular routing is expressed entirely through the public askrene
-layer API.
+for route computation.  The circular routing is expressed entirely
+through the public askrene layer API.
 
 **Status: pre-alpha scaffold.**  The plugin loads (dynamically) and
 the RPC interface parses; planning and execution are under
@@ -16,8 +15,7 @@ construction.
 xrebalance is the *executor* half of rebalancing, in the spirit of
 xpay: callers say which channels to drain, which to fill, how much,
 and at what price; xrebalance handles the how.  Strategy — choosing
-channels, timing, budgets — belongs to higher-level tools (CLBOSS,
-sling, or an operator at the CLI).
+channels, timing, budgets — belongs to higher-level tools.
 
 Design points:
 
@@ -35,17 +33,31 @@ Design points:
 
     xrebalance sources=[scid,...] destinations=[scid,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
-               [label=...] [dryrun=true] [maxparts=N]
+               [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
+
+The parts of one request are **independent payments, not an MPP
+set**: each carries its own preimage, payment_hash, and secret.
+(Sharing one hash would let a node on a settled part's path steal a
+still-in-flight part routed through it; per-part preimages close
+that window, and intermediates cannot even correlate the parts.)
 
 One `xrebalance_part` notification is broadcast per part reaching a
-terminal state, carrying the part's payment_hash/partid/groupid,
-first-hop scid, real return-hop scid, delivered and fee amounts,
-status, and the caller's `label` — enough for callers to keep
-accurate per-channel books without polling.
+terminal state, carrying the part's own payment_hash, its
+part_index, first-hop scid, real return-hop scid, delivered and fee
+amounts, status, and the caller's `label` — the request-level
+correlator, and enough for callers to keep accurate per-channel
+books without polling.
+
+The response is a snapshot: the plan, each part's payment_hash (its
+durable handle), and whatever resolved within the snapshot window —
+`part_wait` seconds (0 = return immediately), defaulting to the
+`xrebalance-part-wait` option.  Parts still pending detach and keep
+settling; their notifications fire when they land.
 
 Options:
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
+    xrebalance-part-wait=<seconds>        # default snapshot window (180)
 
 ## Build and run
 

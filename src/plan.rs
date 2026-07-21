@@ -44,12 +44,48 @@ const MIRROR_BLOCK: u64 = 16_000_000;
 /// The persistent layer holding learned constraints across requests.
 const PERSISTENT_LAYER: &str = "xrebalance";
 
+/// The outcome of planning: translated, sendpay-ready routes.
+pub struct PlanResult {
+    pub maxfee_msat: u64,
+    pub delivered_msat: u64,
+    pub fee_msat: u64,
+    /// getroutes routes with final hops translated to real channels.
+    pub routes: Vec<Value>,
+    /// real scidd -> the scid to name in the onion instead.  An
+    /// unannounced channel's peer rejects forwarding by real scid
+    /// (option_scid_alias privacy); the alias it assigned us --
+    /// listpeerchannels alias.remote, the same value route hints
+    /// carry -- must go in the onion.  Responses and notifications
+    /// keep the real scid; only the onion sees the alias.
+    pub onion_scids: HashMap<String, String>,
+    /// Set when the solve was infeasible (routes empty).
+    pub detail: Option<String>,
+}
+
+/// Render a PlanResult as the dryrun response.
+pub fn dryrun_response(params: &XRebalanceParams, plan: &PlanResult) -> Value {
+    json!({
+        "status": "planned",
+        "label": params.label,
+        "dryrun": true,
+        "amount_msat": params.amount_msat,
+        "maxfee_msat": plan.maxfee_msat,
+        "delivered_msat": plan.delivered_msat,
+        "fee_msat": plan.fee_msat,
+        "routes": plan.routes,
+        "detail": plan.detail,
+    })
+}
+
 /// One usable channel from listpeerchannels.
 struct Chan {
     peer_id: String,
     receivable_msat: u64,
     /// The peer's advertised policy toward us, if known.
     remote_update: Option<Value>,
+    /// The alias the peer assigned for onions naming this channel
+    /// (present and required for unannounced channels).
+    onion_scid: Option<String>,
 }
 
 /// BOLT 7 direction: 0 if `from` is the lexicographically lesser id.
@@ -74,8 +110,8 @@ async fn call(rpc: &mut ClnRpc, method: &str, params: Value) -> Result<Value, Er
         .map_err(|e| anyhow!("{method}: {e}"))
 }
 
-/// Run the planning pipeline and return the dryrun response.
-pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<Value, Error> {
+/// Run the planning pipeline.
+pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult, Error> {
     let mut rpc = ClnRpc::new(&state.rpc_path)
         .await
         .map_err(|e| anyhow!("connecting to lightningd rpc: {e}"))?;
@@ -147,12 +183,16 @@ async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Erro
         else {
             continue;
         };
+        let private = ch["private"].as_bool().unwrap_or(false);
         out.insert(
             scid.to_owned(),
             Chan {
                 peer_id: peer_id.to_owned(),
                 receivable_msat: ch["receivable_msat"].as_u64().unwrap_or(0),
                 remote_update: ch["updates"]["remote"].as_object().is_some().then(|| ch["updates"]["remote"].clone()),
+                onion_scid: (private)
+                    .then(|| ch["alias"]["remote"].as_str().map(str::to_owned))
+                    .flatten(),
             },
         );
     }
@@ -184,13 +224,18 @@ async fn plan_in_layer(
     chans: &HashMap<String, Chan>,
     params: &XRebalanceParams,
     maxfee_msat: u64,
-) -> Result<Value, Error> {
+) -> Result<PlanResult, Error> {
     // Mirror each destination's (peer -> us) direction into us_in,
     // remembering fake scid/dir -> real scid/dir.
     let mut unsplit: HashMap<String, String> = HashMap::new();
+    let mut onion_scids: HashMap<String, String> = HashMap::new();
     for (n, scid) in params.destinations.iter().enumerate() {
         let chan = &chans[scid];
         let update = chan.remote_update.as_ref().expect("validated");
+        let real_scidd = format!("{scid}/{}", dir(&chan.peer_id, self_id));
+        if let Some(alias) = &chan.onion_scid {
+            onion_scids.insert(real_scidd.clone(), alias.clone());
+        }
         let mirror_scid = format!("{MIRROR_BLOCK}x{}x0", n + 1);
         let mirror_scidd =
             format!("{mirror_scid}/{}", dir(&chan.peer_id, FAKE_US_IN));
@@ -223,10 +268,7 @@ async fn plan_in_layer(
             }),
         )
         .await?;
-        unsplit.insert(
-            mirror_scidd,
-            format!("{scid}/{}", dir(&chan.peer_id, self_id)),
-        );
+        unsplit.insert(mirror_scidd, real_scidd);
     }
 
     // Mask: no flow may enter the real us (all inbound dirs off),
@@ -277,17 +319,14 @@ async fn plan_in_layer(
         // request -- also land here in this first cut; the detail
         // string tells the caller which it was.)
         Err(e) => {
-            return Ok(json!({
-                "status": "planned",
-                "label": params.label,
-                "dryrun": true,
-                "amount_msat": params.amount_msat,
-                "maxfee_msat": maxfee_msat,
-                "delivered_msat": 0,
-                "fee_msat": 0,
-                "routes": [],
-                "detail": e.to_string(),
-            }))
+            return Ok(PlanResult {
+                maxfee_msat,
+                delivered_msat: 0,
+                fee_msat: 0,
+                routes: vec![],
+                onion_scids,
+                detail: Some(e.to_string()),
+            })
         }
     };
 
@@ -325,14 +364,12 @@ async fn plan_in_layer(
         ));
     }
 
-    Ok(json!({
-        "status": "planned",
-        "label": params.label,
-        "dryrun": true,
-        "amount_msat": params.amount_msat,
-        "maxfee_msat": maxfee_msat,
-        "delivered_msat": delivered,
-        "fee_msat": fee,
-        "routes": routes,
-    }))
+    Ok(PlanResult {
+        maxfee_msat,
+        delivered_msat: delivered,
+        fee_msat: fee,
+        routes,
+        onion_scids,
+        detail: None,
+    })
 }
