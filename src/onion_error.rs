@@ -6,6 +6,7 @@
 /// payload a BOLT 4 onion failure embeds: the subset
 /// askrene-update-channel accepts, plus the bLIP-18 inbound-fee
 /// TLV.
+#[derive(Clone)]
 pub struct ChanUpdate {
     pub enabled: bool,
     pub cltv_expiry_delta: u16,
@@ -17,6 +18,23 @@ pub struct ChanUpdate {
     /// proportional_millionths), both signed.  None when the update
     /// carries no such TLV.
     pub inbound_fee: Option<(i32, i32)>,
+}
+
+impl ChanUpdate {
+    /// Compare only the fields askrene consumes, excluding the
+    /// inbound-fee TLV: the use is detecting a forwarder that
+    /// returns the identical signed policy we already applied, and
+    /// askrene never prices inbound fees, so a TLV-only change
+    /// would not alter any route we build.
+    pub fn same_policy(&self, o: &ChanUpdate) -> bool {
+        self.enabled == o.enabled
+            && self.cltv_expiry_delta == o.cltv_expiry_delta
+            && self.htlc_minimum_msat == o.htlc_minimum_msat
+            && self.fee_base_msat == o.fee_base_msat
+            && self.fee_proportional_millionths
+                == o.fee_proportional_millionths
+            && self.htlc_maximum_msat == o.htlc_maximum_msat
+    }
 }
 
 /// Which side of the erring node a FEE_INSUFFICIENT (0x100c)
@@ -103,6 +121,7 @@ fn read_bigsize(data: &[u8], pos: &mut usize) -> Option<u64> {
 ///        0x1007 / 0x100e:                  0 bytes
 ///        0x100b / 0x100c (amount):         8 bytes htlc_msat
 ///        0x100d (cltv):                    4 bytes cltv_expiry
+///        0x1014 (disabled):                2 bytes flags
 ///   2  channel_update length (big-endian)
 ///   N  channel_update bytes
 ///
@@ -119,6 +138,7 @@ pub fn parse_chan_update(raw_message_hex: &str) -> Option<ChanUpdate> {
         0x1007 | 0x100e => 0,
         0x100b | 0x100c => 8,
         0x100d => 4,
+        0x1014 => 2,
         _ => return None,
     };
     let mut pos = 2 + header;
@@ -317,6 +337,27 @@ mod tests {
         let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
             .unwrap();
         assert!(cu.inbound_fee.is_none());
+    }
+
+    #[test]
+    fn channel_disabled_via_1014() {
+        let body = make_cu_body(true, 144, 0, 0, 0, 1);
+        let cu = parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
+            .unwrap();
+        assert!(!cu.enabled);
+    }
+
+    #[test]
+    fn same_policy_excludes_inbound_fee() {
+        let body = make_cu_body(false, 144, 1000, 10, 20, 30);
+        let a = parse_chan_update(&make_onion_hex(0x1007, 0, &body, true))
+            .unwrap();
+        let mut b = a.clone();
+        assert!(a.same_policy(&b));
+        b.inbound_fee = Some((5000, 0));
+        assert!(a.same_policy(&b));
+        b.fee_proportional_millionths += 1;
+        assert!(!a.same_policy(&b));
     }
 
     #[test]

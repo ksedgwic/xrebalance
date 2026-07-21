@@ -57,6 +57,8 @@ settling; their notifications fire when they land.
 Options:
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
+    xrebalance-override-age=<seconds>     # expiry of learned policy and
+                                          # node-disable overrides (3600)
     xrebalance-part-wait=<seconds>        # default snapshot window (180)
 
 ## Build and run

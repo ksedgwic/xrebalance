@@ -10,6 +10,7 @@
 mod coalesce;
 mod exec;
 mod onion_error;
+mod overrides;
 mod plan;
 
 use anyhow::anyhow;
@@ -19,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Learned constraints in the persistent xrebalance layer expire
 /// after this many seconds.  Applied lazily before each request (and
@@ -33,6 +34,18 @@ const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
         "xrebalance-constraint-age",
         6 * 60 * 60,
         "seconds until learned constraints in the xrebalance layer expire",
+    );
+
+/// Learned gossip overrides (policy refreshes from onion failures,
+/// node disables) expire after this many seconds.  A separate knob
+/// from the constraint age: overrides assert what a peer enforces
+/// rather than where liquidity sits, and the two decay on different
+/// clocks.
+const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption =
+    DefaultIntegerConfigOption::new_i64_with_default(
+        "xrebalance-override-age",
+        60 * 60,
+        "seconds until learned policy and node-disable overrides expire",
     );
 
 /// Snapshot window: how long the RPC waits so fast outcomes appear
@@ -80,6 +93,11 @@ pub struct State {
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
     pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
+    /// Learned gossip overrides, applied per request (overrides.rs).
+    pub overrides: Arc<Mutex<overrides::Overrides>>,
+    /// Our node id, filled by the first plan; feedback needs it to
+    /// refuse disabling our own node.
+    pub self_id: Arc<OnceLock<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +136,7 @@ pub struct XRebalanceParams {
 async fn main() -> Result<(), Error> {
     let Some(configured) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPT_CONSTRAINT_AGE)
+        .option(OPT_OVERRIDE_AGE)
         .option(OPT_PART_WAIT)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
         .rpcmethod(
@@ -135,6 +154,8 @@ async fn main() -> Result<(), Error> {
     };
     let constraint_age = u64::try_from(configured.option(&OPT_CONSTRAINT_AGE)?)
         .map_err(|_| anyhow!("xrebalance-constraint-age must be positive"))?;
+    let override_age = u64::try_from(configured.option(&OPT_OVERRIDE_AGE)?)
+        .map_err(|_| anyhow!("xrebalance-override-age must be positive"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
         constraint_age,
@@ -144,6 +165,10 @@ async fn main() -> Result<(), Error> {
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
             constraint_age,
         ))),
+        overrides: Arc::new(Mutex::new(overrides::Overrides::new(
+            override_age,
+        ))),
+        self_id: Arc::new(OnceLock::new()),
     };
     let plugin = configured.start(state).await?;
     plugin.join().await

@@ -121,6 +121,7 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
         .as_str()
         .ok_or_else(|| anyhow!("getinfo: missing id"))?
         .to_owned();
+    let _ = state.self_id.set(self_id.clone());
 
     let chans = usable_channels(&mut rpc).await?;
     for scid in params.sources.iter().chain(&params.destinations) {
@@ -162,12 +163,56 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     let split = format!("xrebalance-req-{:x}-{}", now_secs(), std::process::id());
     call(&mut rpc, "askrene-create-layer", json!({"layer": split})).await?;
     let result = plan_in_layer(
-        &mut rpc, &split, &self_id, &chans, params, maxfee_msat,
+        &mut rpc, state, &split, &self_id, &chans, params, maxfee_msat,
     )
     .await;
     // Best-effort cleanup; planning outcome takes precedence.
     let _ = call(&mut rpc, "askrene-remove-layer", json!({"layer": split})).await;
     result
+}
+
+/// Write the still-young learned overrides (overrides.rs) into a
+/// request layer: policy refreshes as channel updates, failed
+/// forwarders as node disables.  Best-effort per entry -- a channel
+/// gone from gossip since we learned about it must not fail the
+/// plan, it just stops benefiting from the override.
+async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
+    let (policies, nodes) = state
+        .overrides
+        .lock()
+        .expect("overrides lock")
+        .snapshot(now_secs());
+    for (scidd, cu) in policies {
+        if let Err(e) = call(
+            rpc,
+            "askrene-update-channel",
+            json!({
+                "layer": layer,
+                "short_channel_id_dir": scidd,
+                "enabled": cu.enabled,
+                "htlc_minimum_msat": cu.htlc_minimum_msat,
+                "htlc_maximum_msat": cu.htlc_maximum_msat,
+                "fee_base_msat": cu.fee_base_msat,
+                "fee_proportional_millionths": cu.fee_proportional_millionths,
+                "cltv_expiry_delta": cu.cltv_expiry_delta,
+            }),
+        )
+        .await
+        {
+            log::debug!("override {scidd}: {e}");
+        }
+    }
+    for node in nodes {
+        if let Err(e) = call(
+            rpc,
+            "askrene-disable-node",
+            json!({"layer": layer, "node": node}),
+        )
+        .await
+        {
+            log::debug!("override disable {node}: {e}");
+        }
+    }
 }
 
 /// Channels we can use, keyed by scid: ours, CHANNELD_NORMAL.
@@ -219,12 +264,15 @@ async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
 
 async fn plan_in_layer(
     rpc: &mut ClnRpc,
+    state: &State,
     split: &str,
     self_id: &str,
     chans: &HashMap<String, Chan>,
     params: &XRebalanceParams,
     maxfee_msat: u64,
 ) -> Result<PlanResult, Error> {
+    apply_overrides(rpc, state, split).await;
+
     // Mirror each destination's (peer -> us) direction into us_in,
     // remembering fake scid/dir -> real scid/dir.
     let mut unsplit: HashMap<String, String> = HashMap::new();

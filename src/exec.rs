@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-use crate::onion_error::{classify_fee_insufficient, parse_chan_update, FeeFault};
+use crate::onion_error::{
+    classify_fee_insufficient, parse_chan_update, ChanUpdate, FeeFault,
+};
 use crate::plan::{PlanResult, PERSISTENT_LAYER};
 use crate::{Claim, State, XRebalanceParams, TOPIC_PART};
 
@@ -46,6 +48,17 @@ const WIRE_TEMPORARY_CHANNEL_FAILURE: u64 = 0x1007;
 /// incoming channel's inbound fee or a stale outgoing policy
 /// (onion_error.rs).
 const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
+
+/// Failcodes whose embedded channel_update names the outgoing
+/// channel's actual policy: amount_below_minimum (UPDATE|11),
+/// incorrect_cltv_expiry (UPDATE|13), expiry_too_soon (UPDATE|14),
+/// channel_disabled (UPDATE|20).  Each becomes a stored policy
+/// override (overrides.rs).
+const WIRE_POLICY_CARRYING: [u64; 4] = [0x100b, 0x100d, 0x100e, 0x1014];
+
+/// BOLT 4 NODE bit: the failure concerns the forwarder itself, not
+/// a channel.
+const NODE_BIT: u64 = 0x2000;
 
 /// Claim-table entries older than this are pruned (a part cannot
 /// outlive its HTLC by this much).
@@ -220,7 +233,15 @@ async fn inform(
 /// may itself be excluded, and one part must not claim both
 /// "carried fine" and "excluded" about the same hop.
 ///
-/// Other failure classes teach us nothing usable yet.
+/// Policy-carrying failures: store the embedded update as an
+/// override for future request layers (apply_policy_refresh).
+///
+/// Node-level failures: disable the forwarder for a while -- but
+/// never our own node, which in a circular rebalance is also the
+/// destination; disabling self would take every channel we have out
+/// of consideration.
+///
+/// Other failure classes teach us nothing usable.
 async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
     let mut rpc = match ClnRpc::new(&state.rpc_path).await {
         Ok(rpc) => rpc,
@@ -240,10 +261,16 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             }
         }
         Some(data) => {
-            let failcode = data["failcode"].as_u64();
-            let fee_insufficient = failcode == Some(WIRE_FEE_INSUFFICIENT);
-            if failcode != Some(WIRE_TEMPORARY_CHANNEL_FAILURE)
+            let Some(failcode) = data["failcode"].as_u64() else {
+                return;
+            };
+            let fee_insufficient = failcode == WIRE_FEE_INSUFFICIENT;
+            let policy_carrying = WIRE_POLICY_CARRYING.contains(&failcode);
+            let node_failure = failcode & NODE_BIT != 0;
+            if failcode != WIRE_TEMPORARY_CHANNEL_FAILURE
                 && !fee_insufficient
+                && !policy_carrying
+                && !node_failure
             {
                 return;
             }
@@ -275,8 +302,28 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 )
                 .await;
             }
+            if node_failure {
+                let Some(node) = data["erring_node"].as_str() else {
+                    return;
+                };
+                if state.self_id.get().map(String::as_str) == Some(node) {
+                    return;
+                }
+                state
+                    .overrides
+                    .lock()
+                    .expect("overrides lock")
+                    .record_disabled_node(node, now_secs());
+                log::debug!("node failure {failcode:#x}: disabling {node}");
+                return;
+            }
             if fee_insufficient {
                 apply_fee_insufficient(state, &mut rpc, part, erring_idx, data)
+                    .await;
+                return;
+            }
+            if policy_carrying {
+                apply_policy_refresh(state, &mut rpc, part, erring_idx, data)
                     .await;
                 return;
             }
@@ -355,8 +402,64 @@ async fn apply_fee_insufficient(
                 cu.enabled,
                 cu.inbound_fee,
             );
+            store_or_escalate(state, rpc, &part.hops[erring_idx], cu).await;
         }
     }
+}
+
+/// Store a returned policy as an override for future request
+/// layers, unless the forwarder returned the identical policy we
+/// already applied -- then another refresh changes nothing (its
+/// enforcement diverges from what it signs) and the channel is
+/// excluded instead, through the same aging constraint as any
+/// exclusion.  Our own channels are skipped: auto.localchans owns
+/// local truth.
+async fn store_or_escalate(
+    state: &State,
+    rpc: &mut ClnRpc,
+    hop: &PartHop,
+    cu: ChanUpdate,
+) {
+    if hop.ours {
+        return;
+    }
+    let now = now_secs();
+    let repeat = state
+        .overrides
+        .lock()
+        .expect("overrides lock")
+        .is_repeat(&hop.scidd, &cu, now);
+    if repeat {
+        inform(state, rpc, &hop.scidd, 1, "constrained").await;
+        log::debug!(
+            "{}: enforcement diverges from its advertised policy; excluded",
+            hop.scidd
+        );
+        return;
+    }
+    state
+        .overrides
+        .lock()
+        .expect("overrides lock")
+        .record_policy(&hop.scidd, cu, now);
+    log::debug!("policy override stored for {}", hop.scidd);
+}
+
+/// A failure naming the outgoing channel's published policy: our
+/// gossip view is behind what the forwarder enforces.  Store the
+/// embedded update as an override for future request layers.
+async fn apply_policy_refresh(
+    state: &State,
+    rpc: &mut ClnRpc,
+    part: &Part,
+    erring_idx: usize,
+    data: &Value,
+) {
+    let Some(cu) = data["raw_message"].as_str().and_then(parse_chan_update)
+    else {
+        return;
+    };
+    store_or_escalate(state, rpc, &part.hops[erring_idx], cu).await;
 }
 
 /// Broadcast one part's terminal state.  Best-effort: a failed
