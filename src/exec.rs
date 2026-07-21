@@ -30,18 +30,22 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+use crate::onion_error::{classify_fee_insufficient, parse_chan_update, FeeFault};
 use crate::plan::{PlanResult, PERSISTENT_LAYER};
 use crate::{Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
 const WAITSENDPAY_TIMEOUT: i32 = 200;
 
-/// BOLT 4 temporary_channel_failure (UPDATE|7): a liquidity failure,
-/// the one failure class whose feedback belongs in the persistent
-/// layer today.  Node-level failures and stale-gossip refreshes need
-/// the side-store machinery (later phase); other codes teach us
-/// nothing about capacity.
+/// BOLT 4 temporary_channel_failure (UPDATE|7): a liquidity
+/// failure; feedback goes to the persistent layer as a capacity
+/// constraint.
 const WIRE_TEMPORARY_CHANNEL_FAILURE: u64 = 0x1007;
+
+/// BOLT 4 fee_insufficient (UPDATE|12): attributed to either the
+/// incoming channel's inbound fee or a stale outgoing policy
+/// (onion_error.rs).
+const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
 
 /// Claim-table entries older than this are pruned (a part cannot
 /// outlive its HTLC by this much).
@@ -208,8 +212,15 @@ async fn inform(
 /// Liquidity failure (temporary_channel_failure at hop N): the
 /// erring channel could not pass its amount -- inform constrained --
 /// and every network hop BEFORE it demonstrably forwarded -- inform
-/// unconstrained.  Other failure classes are not capacity knowledge
-/// and are left for the side-store phase.
+/// unconstrained.
+///
+/// Fee failure (fee_insufficient at hop N): attribute the shortfall
+/// to one side of the erring node (apply_fee_insufficient).  The
+/// unconstrained sweep stops one hop short here: the incoming hop
+/// may itself be excluded, and one part must not claim both
+/// "carried fine" and "excluded" about the same hop.
+///
+/// Other failure classes teach us nothing usable yet.
 async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
     let mut rpc = match ClnRpc::new(&state.rpc_path).await {
         Ok(rpc) => rpc,
@@ -229,7 +240,10 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             }
         }
         Some(data) => {
-            if data["failcode"].as_u64() != Some(WIRE_TEMPORARY_CHANNEL_FAILURE)
+            let failcode = data["failcode"].as_u64();
+            let fee_insufficient = failcode == Some(WIRE_FEE_INSUFFICIENT);
+            if failcode != Some(WIRE_TEMPORARY_CHANNEL_FAILURE)
+                && !fee_insufficient
             {
                 return;
             }
@@ -249,12 +263,22 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             }) else {
                 return;
             };
-            for hop in part.hops[..erring_idx].iter().filter(|h| !h.ours) {
+            let transit_end = if fee_insufficient {
+                erring_idx.saturating_sub(1)
+            } else {
+                erring_idx
+            };
+            for hop in part.hops[..transit_end].iter().filter(|h| !h.ours) {
                 inform(
                     state, &mut rpc, &hop.scidd, hop.amount_msat,
                     "unconstrained",
                 )
                 .await;
+            }
+            if fee_insufficient {
+                apply_fee_insufficient(state, &mut rpc, part, erring_idx, data)
+                    .await;
+                return;
             }
             let erring = &part.hops[erring_idx];
             if !erring.ours {
@@ -264,6 +288,73 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// FEE_INSUFFICIENT (0x100c): the required fee at the erring node
+/// is outbound_fee(erring/outgoing channel) + inbound_fee(incoming
+/// channel), but the error names and carries the policy of the
+/// OUTGOING channel only -- so decide which side is at fault by
+/// comparing the fee the route allocated against the advertised
+/// outbound policy (onion_error.rs).
+///
+/// Inbound case: the incoming channel route[N-1] charges a bLIP-18
+/// inbound fee, which CLN cannot pay and askrene cannot price --
+/// exclude that channel (constrained at 1 msat; the constraint ages
+/// out, so the channel recovers if the peer later drops the fee).
+/// Never our own channel: auto.localchans owns local truth.
+///
+/// Stale-outbound case: our gossip view of the outgoing channel is
+/// stale.  Logged, no layer write -- the policy corrects itself
+/// when gossip catches up, and an exclusion here would indict a
+/// channel whose only offense is a fee we simply did not pay.
+async fn apply_fee_insufficient(
+    state: &State,
+    rpc: &mut ClnRpc,
+    part: &Part,
+    erring_idx: usize,
+    data: &Value,
+) {
+    let out_msat = part.hops[erring_idx].amount_msat;
+    let alloc_msat = if erring_idx >= 1 {
+        part.hops[erring_idx - 1].amount_msat.saturating_sub(out_msat)
+    } else {
+        0
+    };
+    let update = data["raw_message"].as_str().and_then(parse_chan_update);
+    match classify_fee_insufficient(alloc_msat, out_msat, update.as_ref()) {
+        FeeFault::Inbound => {
+            let Some(incoming) = erring_idx
+                .checked_sub(1)
+                .map(|i| &part.hops[i])
+                .filter(|h| !h.ours)
+            else {
+                return;
+            };
+            inform(state, rpc, &incoming.scidd, 1, "constrained").await;
+            log::debug!(
+                "fee_insufficient at {}: attributed to an inbound fee on \
+                 the incoming channel {}; excluded",
+                part.hops[erring_idx].scidd,
+                incoming.scidd,
+            );
+        }
+        FeeFault::StaleOutbound => {
+            let cu = update.expect("StaleOutbound implies an update");
+            log::debug!(
+                "fee_insufficient at {}: stale outbound policy \
+                 (allocated {alloc_msat}msat; advertised base={} prop={} \
+                 min={} max={} cltv={} enabled={} inbound_fee={:?})",
+                part.hops[erring_idx].scidd,
+                cu.fee_base_msat,
+                cu.fee_proportional_millionths,
+                cu.htlc_minimum_msat,
+                cu.htlc_maximum_msat,
+                cu.cltv_expiry_delta,
+                cu.enabled,
+                cu.inbound_fee,
+            );
         }
     }
 }

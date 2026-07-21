@@ -9,6 +9,7 @@
 
 mod coalesce;
 mod exec;
+mod onion_error;
 mod plan;
 
 use anyhow::anyhow;
