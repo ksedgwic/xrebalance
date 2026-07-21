@@ -30,11 +30,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-use crate::plan::PlanResult;
+use crate::plan::{PlanResult, PERSISTENT_LAYER};
 use crate::{Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
 const WAITSENDPAY_TIMEOUT: i32 = 200;
+
+/// BOLT 4 temporary_channel_failure (UPDATE|7): a liquidity failure,
+/// the one failure class whose feedback belongs in the persistent
+/// layer today.  Node-level failures and stale-gossip refreshes need
+/// the side-store machinery (later phase); other codes teach us
+/// nothing about capacity.
+const WIRE_TEMPORARY_CHANNEL_FAILURE: u64 = 0x1007;
 
 /// Claim-table entries older than this are pruned (a part cannot
 /// outlive its HTLC by this much).
@@ -84,6 +91,21 @@ fn hop_to_sendpay(
     }))
 }
 
+/// One hop of a part's route, kept for outcome feedback.
+#[derive(Clone)]
+struct PartHop {
+    /// Real-channel scidd (post-translation for the final hop).
+    scidd: String,
+    /// The scid actually named in the onion (alias for unannounced
+    /// channels) -- what erring_channel reports for this hop.
+    onion_scid: String,
+    /// The HTLC amount crossing this channel.
+    amount_msat: u64,
+    /// Our own channel (first hop out, return hop home): local
+    /// truth belongs to auto.localchans, never the learned layer.
+    ours: bool,
+}
+
 #[derive(Clone)]
 struct Part {
     /// 1-based ordinal within this request (presentation only; at
@@ -98,6 +120,8 @@ struct Part {
     /// amounts, so these are authoritative once a part completes.
     planned_msat: u64,
     planned_sent_msat: u64,
+    /// The route's hops, for writing outcome feedback.
+    hops: Vec<PartHop>,
     status: &'static str,
     detail: Option<String>,
 }
@@ -130,6 +154,85 @@ impl Part {
             "fee_msat": self.fee_msat(),
             "detail": self.detail,
         })
+    }
+}
+
+/// One best-effort inform-channel write into the persistent layer.
+async fn inform(rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: &str) {
+    if let Err(e) = rpc
+        .call_raw::<Value, Value>(
+            "askrene-inform-channel",
+            &json!({
+                "layer": PERSISTENT_LAYER,
+                "short_channel_id_dir": scidd,
+                "amount_msat": amount_msat,
+                "inform": kind,
+            }),
+        )
+        .await
+    {
+        log::debug!("inform {kind} {scidd}: {e}");
+    }
+}
+
+/// Write a terminal part's outcome back to the persistent layer, so
+/// the next request's solve knows what this one learned.
+///
+/// Success: every NETWORK hop demonstrably carried its amount --
+/// inform unconstrained.  Our own channels are excluded (first hop
+/// out and return hop home; auto.localchans owns local truth).
+///
+/// Liquidity failure (temporary_channel_failure at hop N): the
+/// erring channel could not pass its amount -- inform constrained --
+/// and every network hop BEFORE it demonstrably forwarded -- inform
+/// unconstrained.  Other failure classes are not capacity knowledge
+/// and are left for the side-store phase.
+async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
+    let mut rpc = match ClnRpc::new(&state.rpc_path).await {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            log::warn!("feedback rpc connect: {e}");
+            return;
+        }
+    };
+    match fail_data {
+        None => {
+            for hop in part.hops.iter().filter(|h| !h.ours) {
+                inform(&mut rpc, &hop.scidd, hop.amount_msat, "unconstrained")
+                    .await;
+            }
+        }
+        Some(data) => {
+            if data["failcode"].as_u64() != Some(WIRE_TEMPORARY_CHANNEL_FAILURE)
+            {
+                return;
+            }
+            let (Some(chan), Some(dir)) = (
+                data["erring_channel"].as_str(),
+                data["erring_direction"].as_u64(),
+            ) else {
+                return;
+            };
+            // erring_channel reports the scid we named in the onion,
+            // so match aliases too; the direction is node-id derived
+            // and thus identical for alias and real scid.
+            let erring_scidd = format!("{chan}/{dir}");
+            let Some(erring_idx) = part.hops.iter().position(|h| {
+                h.scidd == erring_scidd
+                    || format!("{}/{dir}", h.onion_scid) == erring_scidd
+            }) else {
+                return;
+            };
+            for hop in part.hops[..erring_idx].iter().filter(|h| !h.ours) {
+                inform(&mut rpc, &hop.scidd, hop.amount_msat, "unconstrained")
+                    .await;
+            }
+            let erring = &part.hops[erring_idx];
+            if !erring.ours {
+                inform(&mut rpc, &erring.scidd, erring.amount_msat, "constrained")
+                    .await;
+            }
+        }
     }
 }
 
@@ -167,6 +270,7 @@ async fn background_watch(
         )
     }
     .await;
+    let mut fail_data: Option<Value> = None;
     match outcome {
         Ok(Ok(_)) => part.status = "complete",
         Ok(Err(e)) => {
@@ -175,6 +279,7 @@ async fn background_watch(
                 Some(data) => format!("{} data={data}", e.message),
                 None => e.message.clone(),
             });
+            fail_data = e.data.clone();
             drop_claim(plugin.state(), &part.payment_hash);
         }
         Err(e) => {
@@ -187,6 +292,13 @@ async fn background_watch(
         }
     }
     notify_part(&plugin, &label, &part).await;
+    match (part.status, &fail_data) {
+        ("complete", _) => apply_feedback(plugin.state(), &part, None).await,
+        ("failed", Some(data)) => {
+            apply_feedback(plugin.state(), &part, Some(data)).await
+        }
+        _ => {}
+    }
 }
 
 pub async fn execute(
@@ -242,6 +354,27 @@ pub async fn execute(
             },
         );
 
+        let hops = path
+            .iter()
+            .enumerate()
+            .map(|(h, hop)| {
+                let scidd = hop["short_channel_id_dir"]
+                    .as_str()
+                    .unwrap_or_default();
+                let scid =
+                    scidd.split_once('/').map(|(s, _)| s).unwrap_or_default();
+                PartHop {
+                    scidd: scidd.to_owned(),
+                    onion_scid: plan
+                        .onion_scids
+                        .get(scidd)
+                        .cloned()
+                        .unwrap_or_else(|| scid.to_owned()),
+                    amount_msat: hop["amount_out_msat"].as_u64().unwrap_or(0),
+                    ours: h == 0 || h == path.len() - 1,
+                }
+            })
+            .collect();
         let mut part = Part {
             part_index: (i + 1) as u64,
             payment_hash: payment_hash.clone(),
@@ -255,6 +388,7 @@ pub async fn execute(
                 .to_owned(),
             planned_msat: last["amount_out_msat"].as_u64().unwrap_or(0),
             planned_sent_msat: first["amount_in_msat"].as_u64().unwrap_or(0),
+            hops,
             status: "pending",
             detail: None,
         };
@@ -317,6 +451,7 @@ pub async fn execute(
         });
     for (idx, outcome) in futures::future::join_all(waits).await {
         let part = &mut parts[idx];
+        let mut fail_data: Option<Value> = None;
         let terminal = match outcome {
             Ok(Ok(_)) => {
                 part.status = "complete";
@@ -332,6 +467,7 @@ pub async fn execute(
                     Some(data) => format!("{} data={data}", e.message),
                     None => e.message.clone(),
                 });
+                fail_data = e.data.clone();
                 true
             }
             Err(e) => {
@@ -345,6 +481,13 @@ pub async fn execute(
                 drop_claim(state, &part.payment_hash);
             }
             notify_part(plugin, &params.label, part).await;
+            match (part.status, &fail_data) {
+                ("complete", _) => apply_feedback(state, part, None).await,
+                ("failed", Some(data)) => {
+                    apply_feedback(state, part, Some(data)).await
+                }
+                _ => {}
+            }
         }
     }
 

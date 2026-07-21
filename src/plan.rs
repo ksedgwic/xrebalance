@@ -42,7 +42,7 @@ const FAKE_US_IN: &str =
 const MIRROR_BLOCK: u64 = 16_000_000;
 
 /// The persistent layer holding learned constraints across requests.
-const PERSISTENT_LAYER: &str = "xrebalance";
+pub const PERSISTENT_LAYER: &str = "xrebalance";
 
 /// The outcome of planning: translated, sendpay-ready routes.
 pub struct PlanResult {
@@ -265,6 +265,38 @@ async fn plan_in_layer(
                 "fee_base_msat": update["fee_base_msat"],
                 "fee_proportional_millionths": update["fee_proportional_millionths"],
                 "cltv_expiry_delta": update["cltv_expiry_delta"],
+            }),
+        )
+        .await?;
+        // auto.localchans asserts local liquidity as an exact
+        // constraint (min = max) on the real direction it covers;
+        // carry that onto the mirror, since otherwise the solver
+        // applies its uniform prior to the mirror's capacity.  Same
+        // cap as localchans (bounded by the peer's htlc maximum).
+        let known_msat = chan.receivable_msat.min(
+            update["htlc_maximum_msat"].as_u64().unwrap_or(u64::MAX),
+        );
+        if known_msat > 0 {
+            call(
+                rpc,
+                "askrene-inform-channel",
+                json!({
+                    "layer": split,
+                    "short_channel_id_dir": mirror_scidd,
+                    "amount_msat": known_msat,
+                    "inform": "unconstrained",
+                }),
+            )
+            .await?;
+        }
+        call(
+            rpc,
+            "askrene-inform-channel",
+            json!({
+                "layer": split,
+                "short_channel_id_dir": mirror_scidd,
+                "amount_msat": known_msat + 1,
+                "inform": "constrained",
             }),
         )
         .await?;
