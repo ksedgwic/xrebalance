@@ -53,6 +53,12 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
     assert res['delivered_msat'] == 0, res
     assert res['routes'] == [], res
 
+    # Options are dynamic: setconfig adjusts them in place, without
+    # a plugin restart (which would drop claims and learned state).
+    l1.rpc.setconfig('xrebalance-part-wait', 60)
+    assert l1.rpc.listconfigs('xrebalance-part-wait')[
+        'configs']['xrebalance-part-wait']['value_int'] == 60
+
     # EXECUTE: actually move the funds around the triangle.
     before = only_one(
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']

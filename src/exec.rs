@@ -29,6 +29,7 @@ use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use crate::onion_error::{
     classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate,
@@ -671,7 +672,9 @@ pub async fn execute(
     // Snapshot window: wait (per-request part_wait, defaulting to
     // the xrebalance-part-wait option; 0 skips the wait) so fast
     // outcomes appear in the response; everything is ALSO notified.
-    let wait_secs = params.part_wait.unwrap_or(state.part_wait_secs);
+    let wait_secs = params
+        .part_wait
+        .unwrap_or_else(|| state.part_wait_secs.load(Ordering::Relaxed));
     let waits = parts
         .iter()
         .enumerate()

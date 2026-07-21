@@ -14,12 +14,13 @@ mod overrides;
 mod plan;
 
 use anyhow::anyhow;
-use cln_plugin::options::DefaultIntegerConfigOption;
+use cln_plugin::options::{self, DefaultIntegerConfigOption};
 use cln_plugin::{messages, Builder, Error, Plugin};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Learned constraints in the persistent xrebalance layer expire
@@ -29,12 +30,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Liquidity knowledge decays in hours as network traffic moves
 /// balances; operators on slow networks (e.g. signet) should widen
 /// this to keep accumulated knowledge longer.
+///
+/// All three options are dynamic (setconfig): restarting the plugin
+/// to tune a knob would discard the very state being tuned -- the
+/// claim table (stranding in-flight parts), the learned overrides,
+/// and the coalescer cache.
 const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption::new_i64_with_default(
-        "xrebalance-constraint-age",
-        6 * 60 * 60,
-        "seconds until learned constraints in the xrebalance layer expire",
-    );
+    DefaultIntegerConfigOption {
+        name: "xrebalance-constraint-age",
+        default: 6 * 60 * 60,
+        description:
+            "seconds until learned constraints in the xrebalance layer expire",
+        deprecated: false,
+        dynamic: true,
+        multi: false,
+    };
 
 /// Learned gossip overrides (policy refreshes from onion failures,
 /// node disables) expire after this many seconds.  A separate knob
@@ -42,25 +52,31 @@ const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
 /// rather than where liquidity sits, and the two decay on different
 /// clocks.
 const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption::new_i64_with_default(
-        "xrebalance-override-age",
-        60 * 60,
-        "seconds until learned policy and node-disable overrides expire",
-    );
+    DefaultIntegerConfigOption {
+        name: "xrebalance-override-age",
+        default: 60 * 60,
+        description:
+            "seconds until learned policy and node-disable overrides expire",
+        deprecated: false,
+        dynamic: true,
+        multi: false,
+    };
 
 /// Snapshot window: how long the RPC waits so fast outcomes appear
 /// directly in the response.  The response is only a snapshot -- the
 /// authoritative result channel is the xrebalance_part notification,
 /// emitted for EVERY part's terminal state, before or after the RPC
 /// returns (a background watcher follows stragglers).
-const OPT_PART_WAIT: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption::new_i64_with_default(
-        "xrebalance-part-wait",
-        180,
-        "default seconds the response waits for parts (per-request \
-         part_wait overrides; results always stream via the \
-         xrebalance_part notification)",
-    );
+const OPT_PART_WAIT: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-part-wait",
+    default: 180,
+    description: "default seconds the response waits for parts (per-request \
+                  part_wait overrides; results always stream via the \
+                  xrebalance_part notification)",
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
 
 /// Notification topic: one event per part reaching a terminal state,
 /// carrying the part's own payment_hash (parts are independent
@@ -85,10 +101,12 @@ pub struct State {
     /// Path to the lightningd RPC socket (plugins start with CWD =
     /// lightning-dir, so the relative rpc_file works as-is).
     pub rpc_path: PathBuf,
-    /// Seconds until learned constraints expire.
-    pub constraint_age: u64,
-    /// Bound on the synchronous part wait.
-    pub part_wait_secs: u64,
+    /// Seconds until learned constraints expire (dynamic; read per
+    /// request).
+    pub constraint_age: Arc<AtomicU64>,
+    /// Bound on the synchronous part wait (dynamic; read per
+    /// request).
+    pub part_wait_secs: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
@@ -145,6 +163,7 @@ async fn main() -> Result<(), Error> {
              channels via independent circular self-payments",
             xrebalance,
         )
+        .setconfig_callback(setconfig)
         .hook("htlc_accepted", htlc_accepted)
         .dynamic()
         .configure()
@@ -156,11 +175,12 @@ async fn main() -> Result<(), Error> {
         .map_err(|_| anyhow!("xrebalance-constraint-age must be positive"))?;
     let override_age = u64::try_from(configured.option(&OPT_OVERRIDE_AGE)?)
         .map_err(|_| anyhow!("xrebalance-override-age must be positive"))?;
+    let part_wait = u64::try_from(configured.option(&OPT_PART_WAIT)?)
+        .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
-        constraint_age,
-        part_wait_secs: u64::try_from(configured.option(&OPT_PART_WAIT)?)
-            .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?,
+        constraint_age: Arc::new(AtomicU64::new(constraint_age)),
+        part_wait_secs: Arc::new(AtomicU64::new(part_wait)),
         claims: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
             constraint_age,
@@ -204,6 +224,52 @@ async fn xrebalance(
         return Ok(plan::dryrun_response(&parsed, &planned));
     }
     exec::execute(&_plugin, &parsed, &planned).await
+}
+
+/// Apply a setconfig change to one of the dynamic options.  Values
+/// take effect from the next request or layer write; an error here
+/// vetoes the change and lightningd keeps the old value.  The
+/// framework's own option map is updated too, so listconfigs stays
+/// truthful.
+async fn setconfig(
+    plugin: Plugin<State>,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let name = v["config"]
+        .as_str()
+        .ok_or_else(|| anyhow!("setconfig: missing config name"))?
+        .to_owned();
+    let val = &v["val"];
+    let secs = val
+        .as_i64()
+        .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| anyhow!("{name}: value is not an integer"))?;
+    let secs = u64::try_from(secs)
+        .map_err(|_| anyhow!("{name} must not be negative"))?;
+    let state = plugin.state();
+    match name.as_str() {
+        "xrebalance-constraint-age" => {
+            state.constraint_age.store(secs, Ordering::Relaxed);
+            state
+                .coalescer
+                .lock()
+                .expect("coalescer lock")
+                .set_aging(secs);
+        }
+        "xrebalance-override-age" => {
+            state
+                .overrides
+                .lock()
+                .expect("overrides lock")
+                .set_max_age(secs);
+        }
+        "xrebalance-part-wait" => {
+            state.part_wait_secs.store(secs, Ordering::Relaxed);
+        }
+        _ => return Err(anyhow!("unknown dynamic option {name}")),
+    }
+    plugin.set_option_str(&name, options::Value::Integer(secs as i64))?;
+    Ok(json!({}))
 }
 
 /// Claim arriving parts of our own self-payments: resolve with the

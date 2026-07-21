@@ -27,6 +27,12 @@ impl Overrides {
         }
     }
 
+    /// Track a changed expiry (dynamic option); applies from the
+    /// next snapshot or repeat check.
+    pub fn set_max_age(&mut self, max_age: u64) {
+        self.max_age = max_age;
+    }
+
     fn young(&self, stored_at: u64, now: u64) -> bool {
         now.saturating_sub(stored_at) <= self.max_age
     }
@@ -103,6 +109,15 @@ mod tests {
         assert_eq!(nodes, vec!["02bb"]);
         // The prune is durable, not merely a filtered view.
         assert!(o.policies.len() == 1 && o.disabled_nodes.len() == 1);
+    }
+
+    #[test]
+    fn set_max_age_applies_to_next_snapshot() {
+        let mut o = Overrides::new(1000);
+        o.record_policy("1x1x1/0", cu(10), 100);
+        assert_eq!(o.snapshot(600).0.len(), 1);
+        o.set_max_age(100);
+        assert!(o.snapshot(600).0.is_empty());
     }
 
     #[test]

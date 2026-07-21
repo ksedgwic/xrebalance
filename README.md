@@ -54,7 +54,8 @@ durable handle), and whatever resolved within the snapshot window —
 `xrebalance-part-wait` option.  Parts still pending detach and keep
 settling; their notifications fire when they land.
 
-Options:
+Options (all dynamic -- adjustable at runtime via `lightning-cli
+setconfig`, so tuning never requires a plugin restart):
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
     xrebalance-override-age=<seconds>     # expiry of learned policy and

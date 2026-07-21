@@ -151,7 +151,8 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     };
 
     ensure_persistent_layer(&mut rpc).await?;
-    let cutoff = now_secs().saturating_sub(state.constraint_age);
+    let cutoff =
+        now_secs().saturating_sub(state.constraint_age.load(Ordering::Relaxed));
     call(
         &mut rpc,
         "askrene-age",

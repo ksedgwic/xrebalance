@@ -66,6 +66,14 @@ impl Coalescer {
         }
     }
 
+    /// Track a changed aging window (dynamic option).  Existing
+    /// cache entries keep bucket numbers from the old width; the
+    /// next check sees a different bucket and re-emits, which is
+    /// the safe direction.
+    pub fn set_aging(&mut self, aging_secs: u64) {
+        self.bucket_secs = (aging_secs / WINDOW_DIVISOR).max(1);
+    }
+
     /// Decide whether a write for `key` goes out now.  Returns the
     /// current bucket, to hand to `record` once askrene accepts the
     /// write, or None to suppress.
@@ -177,6 +185,18 @@ mod tests {
         co.record("k", b, 1000);
         assert!(co.check("k", 10, 1000, true).is_none());
         assert!(co.check("k", 11, 1000, true).is_some());
+    }
+
+    #[test]
+    fn set_aging_changes_bucket_width() {
+        let mut co = Coalescer::new(12); // 1s buckets
+        let b = co.check("k", 100, 1000, true).unwrap();
+        co.record("k", b, 1000);
+        assert!(co.check("k", 100, 1000, true).is_none());
+        // The same instant lands in a different bucket number under
+        // the new width, so the next check re-emits.
+        co.set_aging(1200); // 100s buckets
+        assert!(co.check("k", 100, 1000, true).is_some());
     }
 
     #[test]
