@@ -31,7 +31,8 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 use crate::onion_error::{
-    classify_fee_insufficient, parse_chan_update, ChanUpdate, FeeFault,
+    classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate,
+    FeeFault,
 };
 use crate::plan::{PlanResult, PERSISTENT_LAYER};
 use crate::{Claim, State, XRebalanceParams, TOPIC_PART};
@@ -290,6 +291,13 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             }) else {
                 return;
             };
+            log::debug!(
+                "part {} ({}) failed at hop {erring_idx} {erring_scidd}: \
+                 {} ({failcode:#x})",
+                part.part_index,
+                part.payment_hash,
+                failcode_name(failcode),
+            );
             let transit_end = if fee_insufficient {
                 erring_idx.saturating_sub(1)
             } else {
@@ -462,6 +470,23 @@ async fn apply_policy_refresh(
     store_or_escalate(state, rpc, &part.hops[erring_idx], cu).await;
 }
 
+/// Log a per-hop breakdown of a part's route: the amount entering
+/// and leaving each hop (the difference is that hop's fee) and the
+/// cltv stack.  One line per hop, greppable by payment_hash.
+fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
+    for (i, hop) in path.iter().enumerate() {
+        log::debug!(
+            "part {part_index} ({payment_hash}) hop {i} {} \
+             amount {}->{} cltv {}->{}",
+            hop["short_channel_id_dir"].as_str().unwrap_or("?"),
+            hop["amount_in_msat"].as_u64().unwrap_or(0),
+            hop["amount_out_msat"].as_u64().unwrap_or(0),
+            hop["cltv_in"].as_u64().unwrap_or(0),
+            hop["cltv_out"].as_u64().unwrap_or(0),
+        );
+    }
+}
+
 /// Broadcast one part's terminal state.  Best-effort: a failed
 /// notification must not fail the part.
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
@@ -618,6 +643,7 @@ pub async fn execute(
             status: "pending",
             detail: None,
         };
+        log_route(part.part_index, &part.payment_hash, path);
         // A standalone payment per part: no partid/groupid, and
         // amount_msat is this part's own delivered amount (required
         // for to-self payments).

@@ -2,6 +2,26 @@
 //! channel_update, and attribute a FEE_INSUFFICIENT to the side of
 //! the erring node actually at fault.
 
+/// BOLT 4 onion failure code -> short human-readable name, so the
+/// failcode can be grepped by name in logs rather than only the
+/// hex.  "UNKNOWN" for codes not in the table.
+pub fn failcode_name(failcode: u64) -> &'static str {
+    match failcode {
+        0x1007 => "TEMPORARY_CHANNEL_FAILURE",
+        0x100b => "AMOUNT_BELOW_MINIMUM",
+        0x100c => "FEE_INSUFFICIENT",
+        0x100d => "INCORRECT_CLTV_EXPIRY",
+        0x100e => "EXPIRY_TOO_SOON",
+        0x1014 => "CHANNEL_DISABLED",
+        0x2002 => "TEMPORARY_NODE_FAILURE",
+        0x4008 => "PERMANENT_CHANNEL_FAILURE",
+        0x400a => "UNKNOWN_NEXT_PEER",
+        0x4010 => "REQUIRED_CHANNEL_FEATURE_MISSING",
+        0x6002 => "PERMANENT_NODE_FAILURE",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Parsed channel_update policy fields, as extracted from the
 /// payload a BOLT 4 onion failure embeds: the subset
 /// askrene-update-channel accepts, plus the bLIP-18 inbound-fee
@@ -378,6 +398,13 @@ mod tests {
         assert!(parse_chan_update("").is_none());
         // Zero-length channel_update.
         assert!(parse_chan_update("100c00000000000000000000").is_none());
+    }
+
+    #[test]
+    fn failcode_names() {
+        assert_eq!(failcode_name(0x100c), "FEE_INSUFFICIENT");
+        assert_eq!(failcode_name(0x1014), "CHANNEL_DISABLED");
+        assert_eq!(failcode_name(0xdead), "UNKNOWN");
     }
 
     #[test]

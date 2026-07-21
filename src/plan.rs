@@ -27,6 +27,7 @@ use anyhow::{anyhow, Error};
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{State, XRebalanceParams};
@@ -159,8 +160,18 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     .await?;
 
     // Build the per-request split layer; whatever happens afterward,
-    // remove it before returning.
-    let split = format!("xrebalance-req-{:x}-{}", now_secs(), std::process::id());
+    // remove it before returning.  The name must be unique per
+    // request: concurrent requests sharing a scratch layer would
+    // read each other's masks and race the removal.  The sequence
+    // number disambiguates within one second, the pid across plugin
+    // restarts, the timestamp across pid reuse.
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+    let split = format!(
+        "xrebalance-req-{:x}-{}-{}",
+        now_secs(),
+        std::process::id(),
+        REQ_SEQ.fetch_add(1, Ordering::Relaxed),
+    );
     call(&mut rpc, "askrene-create-layer", json!({"layer": split})).await?;
     let result = plan_in_layer(
         &mut rpc, state, &split, &self_id, &chans, params, maxfee_msat,
