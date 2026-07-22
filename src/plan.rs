@@ -223,7 +223,7 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::debug!("override {scidd}: {e}");
+            log::trace!("override {scidd}: {e}");
         }
     }
     for node in nodes {
@@ -234,7 +234,7 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::debug!("override disable {node}: {e}");
+            log::trace!("override disable {node}: {e}");
         }
     }
 }
@@ -472,7 +472,7 @@ async fn plan_in_layer(
             maxfee_msat,
             params.amount_msat,
         ) {
-            log::info!(
+            log::debug!(
                 "pruning part over the fee rate cap: {route_fee}msat on \
                  {route_delivered}msat delivered (budget {maxfee_msat}msat \
                  on {}msat)",

@@ -152,11 +152,12 @@ pub struct XRebalanceParams {
 
 fn main() -> Result<(), Error> {
     // The framework's logger drops records below CLN_PLUGIN_LOG
-    // (default info) inside the process, so our per-request debug
-    // detail never reaches lightningd.  Default our own crate to
-    // debug and let lightningd's log-level decide what shows; an
-    // operator-set CLN_PLUGIN_LOG wins.  Must happen before the
-    // runtime spawns threads.
+    // (default info) inside the process, so our per-request detail
+    // never reaches lightningd.  Default our crate to debug: one
+    // summary line per part.  The per-hop chatter sits at trace,
+    // off by default; set CLN_PLUGIN_LOG=info,xrebalance=trace in
+    // lightningd's environment (plugins inherit it) to get it.
+    // Must happen before the runtime spawns threads.
     if std::env::var_os("CLN_PLUGIN_LOG").is_none() {
         std::env::set_var("CLN_PLUGIN_LOG", "info,xrebalance=debug");
     }

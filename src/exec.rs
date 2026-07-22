@@ -143,6 +143,12 @@ struct Part {
     hops: Vec<PartHop>,
     status: &'static str,
     detail: Option<String>,
+    /// Failure geometry, set at terminal state: how many hops of
+    /// the route went uncrossed (0 = delivered; the erring hop
+    /// counts itself), which channel refused, and the wire code.
+    hops_short: Option<u64>,
+    failcode: Option<u64>,
+    erring_scidd: Option<String>,
 }
 
 impl Part {
@@ -160,6 +166,14 @@ impl Part {
             0
         }
     }
+    /// Record failure geometry from waitsendpay error data.
+    fn note_failure(&mut self, data: &Value) {
+        self.failcode = data["failcode"].as_u64();
+        if let Some(i) = erring_hop_index(self, data) {
+            self.hops_short = Some((self.hops.len() - i) as u64);
+            self.erring_scidd = Some(self.hops[i].scidd.clone());
+        }
+    }
     fn json(&self) -> Value {
         json!({
             "part_index": self.part_index,
@@ -171,9 +185,30 @@ impl Part {
             "delivered_msat": self.delivered_msat(),
             "sent_msat": self.planned_sent_msat,
             "fee_msat": self.fee_msat(),
+            "hops_short": self.hops_short,
+            "failcode": self.failcode,
+            "erring_scidd": self.erring_scidd,
             "detail": self.detail,
         })
     }
+}
+
+/// Locate a failure's erring hop in a part's route.  erring_channel
+/// reports the scid we named in the onion, so match aliases too;
+/// the direction is node-id derived and thus identical for alias
+/// and real scid.
+fn erring_hop_index(part: &Part, data: &Value) -> Option<usize> {
+    let (Some(chan), Some(dir)) = (
+        data["erring_channel"].as_str(),
+        data["erring_direction"].as_u64(),
+    ) else {
+        return None;
+    };
+    let erring_scidd = format!("{chan}/{dir}");
+    part.hops.iter().position(|h| {
+        h.scidd == erring_scidd
+            || format!("{}/{dir}", h.onion_scid) == erring_scidd
+    })
 }
 
 /// One best-effort inform-channel write into the persistent layer,
@@ -213,7 +248,7 @@ async fn inform(
             .lock()
             .expect("coalescer lock")
             .record(&key, bucket, amount_msat),
-        Err(e) => log::debug!("inform {kind} {scidd}: {e}"),
+        Err(e) => log::trace!("inform {kind} {scidd}: {e}"),
     }
 }
 
@@ -276,27 +311,15 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             {
                 return;
             }
-            let (Some(chan), Some(dir)) = (
-                data["erring_channel"].as_str(),
-                data["erring_direction"].as_u64(),
-            ) else {
+            let Some(erring_idx) = erring_hop_index(part, data) else {
                 return;
             };
-            // erring_channel reports the scid we named in the onion,
-            // so match aliases too; the direction is node-id derived
-            // and thus identical for alias and real scid.
-            let erring_scidd = format!("{chan}/{dir}");
-            let Some(erring_idx) = part.hops.iter().position(|h| {
-                h.scidd == erring_scidd
-                    || format!("{}/{dir}", h.onion_scid) == erring_scidd
-            }) else {
-                return;
-            };
-            log::debug!(
-                "part {} ({}) failed at hop {erring_idx} {erring_scidd}: \
+            log::trace!(
+                "part {} ({}) failed at hop {erring_idx} {}: \
                  {} ({failcode:#x})",
                 part.part_index,
                 part.payment_hash,
+                part.hops[erring_idx].scidd,
                 failcode_name(failcode),
             );
             let transit_end = if fee_insufficient {
@@ -323,7 +346,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                     .lock()
                     .expect("overrides lock")
                     .record_disabled_node(node, now_secs());
-                log::debug!("node failure {failcode:#x}: disabling {node}");
+                log::trace!("node failure {failcode:#x}: disabling {node}");
                 return;
             }
             if fee_insufficient {
@@ -389,7 +412,7 @@ async fn apply_fee_insufficient(
                 return;
             };
             inform(state, rpc, &incoming.scidd, 1, "constrained").await;
-            log::debug!(
+            log::trace!(
                 "fee_insufficient at {}: attributed to an inbound fee on \
                  the incoming channel {}; excluded",
                 part.hops[erring_idx].scidd,
@@ -398,7 +421,7 @@ async fn apply_fee_insufficient(
         }
         FeeFault::StaleOutbound => {
             let cu = update.expect("StaleOutbound implies an update");
-            log::debug!(
+            log::trace!(
                 "fee_insufficient at {}: stale outbound policy \
                  (allocated {alloc_msat}msat; advertised base={} prop={} \
                  min={} max={} cltv={} enabled={} inbound_fee={:?})",
@@ -440,7 +463,7 @@ async fn store_or_escalate(
         .is_repeat(&hop.scidd, &cu, now);
     if repeat {
         inform(state, rpc, &hop.scidd, 1, "constrained").await;
-        log::debug!(
+        log::trace!(
             "{}: enforcement diverges from its advertised policy; excluded",
             hop.scidd
         );
@@ -451,7 +474,7 @@ async fn store_or_escalate(
         .lock()
         .expect("overrides lock")
         .record_policy(&hop.scidd, cu, now);
-    log::debug!("policy override stored for {}", hop.scidd);
+    log::trace!("policy override stored for {}", hop.scidd);
 }
 
 /// A failure naming the outgoing channel's published policy: our
@@ -474,9 +497,11 @@ async fn apply_policy_refresh(
 /// Log a per-hop breakdown of a part's route: the amount entering
 /// and leaving each hop (the difference is that hop's fee) and the
 /// cltv stack.  One line per hop, greppable by payment_hash.
+/// Trace level: the per-part summary in notify_part is the
+/// day-to-day line.
 fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
     for (i, hop) in path.iter().enumerate() {
-        log::debug!(
+        log::trace!(
             "part {part_index} ({payment_hash}) hop {i} {} \
              amount {}->{} cltv {}->{}",
             hop["short_channel_id_dir"].as_str().unwrap_or("?"),
@@ -489,8 +514,37 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
 }
 
 /// Broadcast one part's terminal state.  Best-effort: a failed
-/// notification must not fail the part.
+/// notification must not fail the part.  Every terminal part
+/// passes through here, so this is also where each part gets its
+/// one summary log line (debug; the per-hop detail is at trace).
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
+    if part.status == "complete" {
+        let fee = part.fee_msat();
+        let ppm = if part.planned_msat > 0 {
+            fee.saturating_mul(1_000_000) / part.planned_msat
+        } else {
+            0
+        };
+        log::debug!(
+            "part {} complete: delivered {}msat fee {fee}msat ({ppm}ppm)",
+            part.part_index,
+            part.delivered_msat(),
+        );
+    } else {
+        let geometry = match (part.hops_short, &part.erring_scidd) {
+            (Some(n), Some(s)) => format!(" {n} hops short at {s}"),
+            _ => String::new(),
+        };
+        let code = match part.failcode {
+            Some(c) => format!(": {} ({c:#x})", failcode_name(c)),
+            None => String::new(),
+        };
+        log::debug!(
+            "part {} failed{geometry}{code}, planned {}msat",
+            part.part_index,
+            part.planned_msat,
+        );
+    }
     let mut payload = part.json();
     payload["label"] = json!(label);
     if let Err(e) = plugin
@@ -524,7 +578,10 @@ async fn background_watch(
     .await;
     let mut fail_data: Option<Value> = None;
     match outcome {
-        Ok(Ok(_)) => part.status = "complete",
+        Ok(Ok(_)) => {
+            part.status = "complete";
+            part.hops_short = Some(0);
+        }
         Ok(Err(e)) => {
             part.status = "failed";
             part.detail = Some(match &e.data {
@@ -532,6 +589,9 @@ async fn background_watch(
                 None => e.message.clone(),
             });
             fail_data = e.data.clone();
+            if let Some(data) = &fail_data {
+                part.note_failure(data);
+            }
             drop_claim(plugin.state(), &part.payment_hash);
         }
         Err(e) => {
@@ -643,6 +703,9 @@ pub async fn execute(
             hops,
             status: "pending",
             detail: None,
+            hops_short: None,
+            failcode: None,
+            erring_scidd: None,
         };
         log_route(part.part_index, &part.payment_hash, path);
         // A standalone payment per part: no partid/groupid, and
@@ -710,6 +773,7 @@ pub async fn execute(
         let terminal = match outcome {
             Ok(Ok(_)) => {
                 part.status = "complete";
+                part.hops_short = Some(0);
                 true
             }
             Ok(Err(e)) if e.code == Some(WAITSENDPAY_TIMEOUT) => {
@@ -723,6 +787,9 @@ pub async fn execute(
                     None => e.message.clone(),
                 });
                 fail_data = e.data.clone();
+                if let Some(data) = &fail_data {
+                    part.note_failure(data);
+                }
                 true
             }
             Err(e) => {
