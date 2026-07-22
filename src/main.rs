@@ -150,8 +150,23 @@ pub struct XRebalanceParams {
     part_wait: Option<u64>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
+    // The framework's logger drops records below CLN_PLUGIN_LOG
+    // (default info) inside the process, so our per-request debug
+    // detail never reaches lightningd.  Default our own crate to
+    // debug and let lightningd's log-level decide what shows; an
+    // operator-set CLN_PLUGIN_LOG wins.  Must happen before the
+    // runtime spawns threads.
+    if std::env::var_os("CLN_PLUGIN_LOG").is_none() {
+        std::env::set_var("CLN_PLUGIN_LOG", "info,xrebalance=debug");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Error> {
     let Some(configured) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPT_CONSTRAINT_AGE)
         .option(OPT_OVERRIDE_AGE)
@@ -191,6 +206,14 @@ async fn main() -> Result<(), Error> {
         self_id: Arc::new(OnceLock::new()),
     };
     let plugin = configured.start(state).await?;
+    log::info!(
+        "xrebalance v{} started: constraint-age {}s, override-age {}s, \
+         part-wait {}s",
+        env!("CARGO_PKG_VERSION"),
+        constraint_age,
+        override_age,
+        part_wait,
+    );
     plugin.join().await
 }
 
