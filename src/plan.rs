@@ -423,13 +423,38 @@ async fn plan_in_layer(
         // request -- also land here in this first cut; the detail
         // string tells the caller which it was.)
         Err(e) => {
+            let raw = e.to_string();
+            // askrene's no-usable-paths diagnostic (205) names the
+            // closest unusable path, which here means our own mask
+            // layer and mirror scids -- internals this API never
+            // otherwise exposes, and nothing a caller can act on.
+            // Summarize when the message names the request layer;
+            // the raw text goes to the log.
+            let detail = if raw.contains(split) {
+                log::trace!(
+                    "req {}: getroutes: {raw}",
+                    params.label.as_deref().unwrap_or("?"),
+                );
+                let code = raw
+                    .split("Error code ")
+                    .nth(1)
+                    .and_then(|s| s.split(':').next())
+                    .map(|c| format!(" (getroutes {c})"))
+                    .unwrap_or_default();
+                format!(
+                    "no usable route from the sources to the \
+                     destinations at this amount and budget{code}"
+                )
+            } else {
+                raw
+            };
             return Ok(PlanResult {
                 maxfee_msat,
                 delivered_msat: 0,
                 fee_msat: 0,
                 routes: vec![],
                 onion_scids,
-                detail: Some(e.to_string()),
+                detail: Some(detail),
             })
         }
     };
