@@ -98,6 +98,18 @@ fn dir(from: &str, to: &str) -> u64 {
     }
 }
 
+/// Whether one part's fee honors the caller's fee rate
+/// (maxfee_msat / amount_msat) on the amount the part delivers.
+fn part_within_rate(
+    fee_msat: u64,
+    delivered_msat: u64,
+    maxfee_msat: u64,
+    amount_msat: u64,
+) -> bool {
+    u128::from(fee_msat) * u128::from(amount_msat)
+        <= u128::from(maxfee_msat) * u128::from(delivered_msat)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -424,15 +436,18 @@ async fn plan_in_layer(
 
     // Translate final hops back to real channels: ours is the only
     // mapping in existence, because we allocated the mirror scids.
-    let mut routes = solved["routes"].as_array().cloned().unwrap_or_default();
+    let solved_routes =
+        solved["routes"].as_array().cloned().unwrap_or_default();
+    let n_solved = solved_routes.len();
+    let mut routes = Vec::with_capacity(n_solved);
     let mut delivered: u64 = 0;
     let mut sent: u64 = 0;
-    for route in &mut routes {
+    for mut route in solved_routes {
         let path = route["path"]
             .as_array_mut()
             .ok_or_else(|| anyhow!("getroutes: route without path"))?;
         let first = path.first().ok_or_else(|| anyhow!("empty path"))?;
-        sent += first["amount_in_msat"].as_u64().unwrap_or(0);
+        let route_sent = first["amount_in_msat"].as_u64().unwrap_or(0);
         let last = path.last_mut().ok_or_else(|| anyhow!("empty path"))?;
         if last["node_id_out"].as_str() != Some(FAKE_US_IN) {
             return Err(anyhow!("getroutes: route does not end at the split node"));
@@ -445,16 +460,45 @@ async fn plan_in_layer(
             .ok_or_else(|| anyhow!("final hop over unknown mirror {fake_scidd}"))?;
         last["short_channel_id_dir"] = json!(real_scidd);
         last["node_id_out"] = json!(self_id);
-        delivered += last["amount_out_msat"].as_u64().unwrap_or(0);
+        let route_delivered = last["amount_out_msat"].as_u64().unwrap_or(0);
+        let route_fee = route_sent.saturating_sub(route_delivered);
+        // The quote budget is aggregate, but parts settle
+        // independently: if the cheap parts fail and an expensive
+        // one completes, the delivered total is priced over the
+        // caller's rate.  Each part must honor the rate on its own.
+        if !part_within_rate(
+            route_fee,
+            route_delivered,
+            maxfee_msat,
+            params.amount_msat,
+        ) {
+            log::info!(
+                "pruning part over the fee rate cap: {route_fee}msat on \
+                 {route_delivered}msat delivered (budget {maxfee_msat}msat \
+                 on {}msat)",
+                params.amount_msat,
+            );
+            continue;
+        }
+        sent += route_sent;
+        delivered += route_delivered;
+        routes.push(route);
     }
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
-    // and re-checked here post-route.
+    // per part above, and re-checked here post-route.
     if fee > maxfee_msat {
         return Err(anyhow!(
             "planned fee {fee}msat exceeds budget {maxfee_msat}msat"
         ));
     }
+    let detail = if routes.is_empty() && n_solved > 0 {
+        Some(format!(
+            "all {n_solved} planned parts exceeded the fee rate cap"
+        ))
+    } else {
+        None
+    };
 
     Ok(PlanResult {
         maxfee_msat,
@@ -462,6 +506,44 @@ async fn plan_in_layer(
         fee_msat: fee,
         routes,
         onion_scids,
-        detail: None,
+        detail,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::part_within_rate;
+
+    // Budget 100msat on 1_000_000msat = 100ppm; a part delivering
+    // 100_000msat may charge at most 10msat.
+    #[test]
+    fn at_the_rate_is_within() {
+        assert!(part_within_rate(10, 100_000, 100, 1_000_000));
+    }
+
+    #[test]
+    fn over_the_rate_is_pruned() {
+        assert!(!part_within_rate(11, 100_000, 100, 1_000_000));
+    }
+
+    #[test]
+    fn zero_fee_is_within() {
+        assert!(part_within_rate(0, 100_000, 0, 1_000_000));
+    }
+
+    #[test]
+    fn fee_without_delivery_is_pruned() {
+        assert!(!part_within_rate(1, 0, 100, 1_000_000));
+    }
+
+    #[test]
+    fn no_overflow_at_extremes() {
+        assert!(part_within_rate(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        ));
+        assert!(!part_within_rate(u64::MAX, 1, 1, u64::MAX));
+    }
 }
