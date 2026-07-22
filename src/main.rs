@@ -134,7 +134,9 @@ pub struct XRebalanceParams {
     #[serde(default)]
     maxfee_msat: Option<u64>,
     /// Caller correlation id, echoed in the response and in every
-    /// xrebalance_part notification.
+    /// xrebalance_part notification, and prefixed to this request's
+    /// log lines.  Defaults to a random 8-hex-char id so concurrent
+    /// requests never share a log prefix.
     #[serde(default)]
     label: Option<String>,
     /// Plan only: compute and return routes, execute nothing.
@@ -148,6 +150,20 @@ pub struct XRebalanceParams {
     /// xrebalance_part notification either way.
     #[serde(default)]
     part_wait: Option<u64>,
+}
+
+/// Group digits with '_' for log readability: 10005958 -> 10_005_958.
+/// Log lines only; JSON values stay plain numbers.
+pub fn eng(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn main() -> Result<(), Error> {
@@ -211,9 +227,9 @@ async fn run() -> Result<(), Error> {
         "xrebalance v{} started: constraint-age {}s, override-age {}s, \
          part-wait {}s",
         env!("CARGO_PKG_VERSION"),
-        constraint_age,
-        override_age,
-        part_wait,
+        eng(constraint_age),
+        eng(override_age),
+        eng(part_wait),
     );
     plugin.join().await
 }
@@ -222,8 +238,11 @@ async fn xrebalance(
     _plugin: Plugin<State>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let parsed: XRebalanceParams = serde_json::from_value(params)
+    let mut parsed: XRebalanceParams = serde_json::from_value(params)
         .map_err(|e| anyhow!("invalid parameters: {e} (pass parameters by keyword)"))?;
+    if parsed.label.is_none() {
+        parsed.label = Some(format!("{:08x}", rand::random::<u32>()));
+    }
 
     if parsed.maxfee_ppm.is_none() == parsed.maxfee_msat.is_none() {
         return Err(anyhow!(
@@ -242,8 +261,45 @@ async fn xrebalance(
         return Err(anyhow!("amount_msat must be positive"));
     }
 
+    // Log the budget in both forms, whichever one was given
+    // (amount_msat is validated positive above).
+    let budget_msat = parsed.maxfee_msat.unwrap_or_else(|| {
+        u64::try_from(
+            u128::from(parsed.amount_msat)
+                * u128::from(parsed.maxfee_ppm.unwrap_or(0))
+                / 1_000_000,
+        )
+        .unwrap_or(u64::MAX)
+    });
+    let budget_ppm = u128::from(budget_msat) * 1_000_000
+        / u128::from(parsed.amount_msat);
+    log::debug!(
+        "req {}: move up to {}msat, {} sources -> {} destinations, \
+         budget {}msat ({}ppm){}",
+        parsed.label.as_deref().unwrap_or("?"),
+        eng(parsed.amount_msat),
+        parsed.sources.len(),
+        parsed.destinations.len(),
+        eng(budget_msat),
+        eng(u64::try_from(budget_ppm).unwrap_or(u64::MAX)),
+        if parsed.dryrun.unwrap_or(false) {
+            " (dryrun)"
+        } else {
+            ""
+        },
+    );
     let state = _plugin.state();
     let planned = plan::plan(state, &parsed).await?;
+    if planned.routes.is_empty() {
+        log::debug!(
+            "req {}: no parts: {}",
+            parsed.label.as_deref().unwrap_or("?"),
+            planned
+                .detail
+                .as_deref()
+                .unwrap_or("planner returned no routes"),
+        );
+    }
     if parsed.dryrun.unwrap_or(false) {
         return Ok(plan::dryrun_response(&parsed, &planned));
     }
@@ -321,4 +377,18 @@ async fn htlc_accepted(
         }
     }
     Ok(json!({"result": "continue"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eng;
+
+    #[test]
+    fn eng_groups_digits() {
+        assert_eq!(eng(0), "0");
+        assert_eq!(eng(999), "999");
+        assert_eq!(eng(1000), "1_000");
+        assert_eq!(eng(10005958), "10_005_958");
+        assert_eq!(eng(u64::MAX), "18_446_744_073_709_551_615");
+    }
 }

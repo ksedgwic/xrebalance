@@ -36,7 +36,7 @@ use crate::onion_error::{
     FeeFault,
 };
 use crate::plan::{PlanResult, PERSISTENT_LAYER};
-use crate::{Claim, State, XRebalanceParams, TOPIC_PART};
+use crate::{eng, Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
 const WAITSENDPAY_TIMEOUT: i32 = 200;
@@ -130,6 +130,8 @@ struct Part {
     /// 1-based ordinal within this request (presentation only; at
     /// the sendpay level every part is a standalone payment).
     part_index: u64,
+    /// How many parts this request planned, for "part 2/5" lines.
+    parts_total: u64,
     /// This part's own payment hash -- its durable handle.
     payment_hash: String,
     first_hop: String,
@@ -423,13 +425,14 @@ async fn apply_fee_insufficient(
             let cu = update.expect("StaleOutbound implies an update");
             log::trace!(
                 "fee_insufficient at {}: stale outbound policy \
-                 (allocated {alloc_msat}msat; advertised base={} prop={} \
+                 (allocated {}msat; advertised base={} prop={} \
                  min={} max={} cltv={} enabled={} inbound_fee={:?})",
                 part.hops[erring_idx].scidd,
+                eng(alloc_msat),
                 cu.fee_base_msat,
                 cu.fee_proportional_millionths,
-                cu.htlc_minimum_msat,
-                cu.htlc_maximum_msat,
+                eng(cu.htlc_minimum_msat),
+                eng(cu.htlc_maximum_msat),
                 cu.cltv_expiry_delta,
                 cu.enabled,
                 cu.inbound_fee,
@@ -505,8 +508,8 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
             "part {part_index} ({payment_hash}) hop {i} {} \
              amount {}->{} cltv {}->{}",
             hop["short_channel_id_dir"].as_str().unwrap_or("?"),
-            hop["amount_in_msat"].as_u64().unwrap_or(0),
-            hop["amount_out_msat"].as_u64().unwrap_or(0),
+            eng(hop["amount_in_msat"].as_u64().unwrap_or(0)),
+            eng(hop["amount_out_msat"].as_u64().unwrap_or(0)),
             hop["cltv_in"].as_u64().unwrap_or(0),
             hop["cltv_out"].as_u64().unwrap_or(0),
         );
@@ -518,6 +521,7 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
 /// passes through here, so this is also where each part gets its
 /// one summary log line (debug; the per-hop detail is at trace).
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
+    let req = label.as_deref().unwrap_or("?");
     if part.status == "complete" {
         let fee = part.fee_msat();
         let ppm = if part.planned_msat > 0 {
@@ -526,9 +530,13 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             0
         };
         log::debug!(
-            "part {} complete: delivered {}msat fee {fee}msat ({ppm}ppm)",
+            "req {req}: part {}/{} complete: delivered {}msat fee {}msat \
+             ({}ppm)",
             part.part_index,
-            part.delivered_msat(),
+            part.parts_total,
+            eng(part.delivered_msat()),
+            eng(fee),
+            eng(ppm),
         );
     } else {
         let geometry = match (part.hops_short, &part.erring_scidd) {
@@ -540,9 +548,10 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             None => String::new(),
         };
         log::debug!(
-            "part {} failed{geometry}{code}, planned {}msat",
+            "req {req}: part {}/{} failed{geometry}{code}, planned {}msat",
             part.part_index,
-            part.planned_msat,
+            part.parts_total,
+            eng(part.planned_msat),
         );
     }
     let mut payload = part.json();
@@ -689,6 +698,7 @@ pub async fn execute(
             .collect();
         let mut part = Part {
             part_index: (i + 1) as u64,
+            parts_total: plan.routes.len() as u64,
             payment_hash: payment_hash.clone(),
             first_hop: first["short_channel_id_dir"]
                 .as_str()
