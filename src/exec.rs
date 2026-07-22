@@ -58,6 +58,13 @@ const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
 /// override (overrides.rs).
 const WIRE_POLICY_CARRYING: [u64; 4] = [0x100b, 0x100d, 0x100e, 0x1014];
 
+/// BOLT 4 unknown_next_peer (PERM|10): the forwarder has no usable
+/// next channel -- closed but still gossiped, or the peer is
+/// offline.  The direction is excluded (constrained at 1msat, aging
+/// out normally); otherwise askrene re-proposes it until the gossip
+/// catches up.
+const WIRE_UNKNOWN_NEXT_PEER: u64 = 0x400a;
+
 /// BOLT 4 NODE bit: the failure concerns the forwarder itself, not
 /// a channel.
 const NODE_BIT: u64 = 0x2000;
@@ -306,10 +313,12 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             let fee_insufficient = failcode == WIRE_FEE_INSUFFICIENT;
             let policy_carrying = WIRE_POLICY_CARRYING.contains(&failcode);
             let node_failure = failcode & NODE_BIT != 0;
+            let dead_next = failcode == WIRE_UNKNOWN_NEXT_PEER;
             if failcode != WIRE_TEMPORARY_CHANNEL_FAILURE
                 && !fee_insufficient
                 && !policy_carrying
                 && !node_failure
+                && !dead_next
             {
                 return;
             }
@@ -363,11 +372,12 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             }
             let erring = &part.hops[erring_idx];
             if !erring.ours {
-                inform(
-                    state, &mut rpc, &erring.scidd, erring.amount_msat,
-                    "constrained",
-                )
-                .await;
+                // A liquidity failure constrains at the amount that
+                // could not pass; a dead next-channel is excluded
+                // outright (1msat), aging out like any constraint.
+                let msat = if dead_next { 1 } else { erring.amount_msat };
+                inform(state, &mut rpc, &erring.scidd, msat, "constrained")
+                    .await;
             }
         }
     }
