@@ -115,6 +115,20 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
         == before2 + 50000)
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'zero-wait'")
 
+    # The stats command summarizes the persistent layer and the
+    # in-memory stores.  After the transfers above: constraints
+    # recorded, nothing but constraints in the layer, no lingering
+    # claims (consumed on settle).
+    stats = l1.rpc.call('xrebalance-stats')
+    assert stats['layer']['exists'], stats
+    assert stats['layer']['constraints'] >= 1, stats
+    assert stats['layer']['channel_updates'] == 0, stats
+    assert stats['layer']['disabled_nodes'] == 0, stats
+    assert stats['layer']['created_channels'] == 0, stats
+    assert stats['claims'] == 0, stats
+    assert stats['layer']['dirs_with_min'] >= 1, stats
+    assert stats['layer']['depth_max'] >= 1, stats
+
 
 def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
                           part_subscriber):

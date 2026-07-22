@@ -195,6 +195,12 @@ async fn run() -> Result<(), Error> {
              channels via independent circular self-payments",
             xrebalance,
         )
+        .rpcmethod(
+            "xrebalance-stats",
+            "Report plugin state: persistent-layer contents, learned \
+             overrides, claim table, coalescer cache",
+            xrebalance_stats,
+        )
         .setconfig_callback(setconfig)
         .hook("htlc_accepted", htlc_accepted)
         .dynamic()
@@ -304,6 +310,122 @@ async fn xrebalance(
         return Ok(plan::dryrun_response(&parsed, &planned));
     }
     exec::execute(&_plugin, &parsed, &planned).await
+}
+
+/// Report the plugin's state in one place: what the persistent
+/// layer holds (constraints should be the ONLY population; nonzero
+/// channel_updates / disabled_nodes / created_channels there would
+/// mean something is leaking past the per-request split layers),
+/// plus the in-memory stores.  Read-only; the shape is meant to
+/// grow fields, not change them.
+async fn xrebalance_stats(
+    plugin: Plugin<State>,
+    _params: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let state = plugin.state();
+    let claims = state.claims.lock().expect("claims lock").len();
+    let coalescer = state.coalescer.lock().expect("coalescer lock").len();
+    let (policies, disabled_nodes) =
+        state.overrides.lock().expect("overrides lock").counts();
+
+    let mut rpc = cln_rpc::ClnRpc::new(&state.rpc_path)
+        .await
+        .map_err(|e| anyhow!("connecting to lightningd rpc: {e}"))?;
+    let listed = rpc
+        .call_raw::<serde_json::Value, serde_json::Value>(
+            "askrene-listlayers",
+            &json!({"layer": plan::PERSISTENT_LAYER}),
+        )
+        .await
+        .map_err(|e| anyhow!("askrene-listlayers: {e}"))?;
+    let layer = match listed["layers"].as_array().and_then(|l| l.first()) {
+        None => json!({"exists": false}),
+        Some(l) => {
+            let constraints =
+                l["constraints"].as_array().cloned().unwrap_or_default();
+            let minimums = constraints
+                .iter()
+                .filter(|c| c["minimum_msat"].is_u64())
+                .count();
+            // Breadth: distinct directions, split by bound kind
+            // (a direction with a max-bound is one askrene can
+            // short-circuit at plan time).  Depth: entries stacked
+            // per direction.
+            let mut depth: HashMap<&str, u64> = HashMap::new();
+            let mut dirs_with_max: std::collections::HashSet<&str> =
+                Default::default();
+            let mut dirs_with_min: std::collections::HashSet<&str> =
+                Default::default();
+            for c in &constraints {
+                let Some(d) = c["short_channel_id_dir"].as_str() else {
+                    continue;
+                };
+                *depth.entry(d).or_insert(0) += 1;
+                if c["maximum_msat"].is_u64() {
+                    dirs_with_max.insert(d);
+                }
+                if c["minimum_msat"].is_u64() {
+                    dirs_with_min.insert(d);
+                }
+            }
+            let mut depths: Vec<u64> = depth.values().copied().collect();
+            depths.sort_unstable();
+            // Nearest-rank percentile, as the contrib layer-summary
+            // script computes it.
+            let pct = |q: f64| -> u64 {
+                match depths.len() {
+                    0 => 0,
+                    n => depths[(q * (n - 1) as f64).round() as usize],
+                }
+            };
+            let timestamps: Vec<u64> = constraints
+                .iter()
+                .filter_map(|c| c["timestamp"].as_u64())
+                .collect();
+            let count = |key: &str| {
+                l[key].as_array().map(|a| a.len()).unwrap_or(0)
+            };
+            json!({
+                "exists": true,
+                "constraints": constraints.len(),
+                "constraint_minimums": minimums,
+                "constraint_maximums": constraints.len() - minimums,
+                "constraint_scidds": depth.len(),
+                "dirs_with_max": dirs_with_max.len(),
+                "dirs_with_min": dirs_with_min.len(),
+                "depth_min": depths.first().copied().unwrap_or(0),
+                "depth_median": pct(0.5),
+                "depth_p90": pct(0.9),
+                "depth_max": depths.last().copied().unwrap_or(0),
+                "oldest_constraint": timestamps.iter().min(),
+                "newest_constraint": timestamps.iter().max(),
+                "channel_updates": count("channel_updates"),
+                "disabled_nodes": count("disabled_nodes"),
+                "created_channels": count("created_channels"),
+                "biases": count("biases"),
+            })
+        }
+    };
+
+    Ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "options": {
+            "constraint_age": state.constraint_age.load(Ordering::Relaxed),
+            "override_age": state
+                .overrides
+                .lock()
+                .expect("overrides lock")
+                .max_age(),
+            "part_wait": state.part_wait_secs.load(Ordering::Relaxed),
+        },
+        "claims": claims,
+        "coalescer_entries": coalescer,
+        "overrides": {
+            "channel_updates": policies,
+            "disabled_nodes": disabled_nodes,
+        },
+        "layer": layer,
+    }))
 }
 
 /// Apply a setconfig change to one of the dynamic options.  Values

@@ -60,6 +60,17 @@ impl Overrides {
         self.disabled_nodes.insert(node.to_owned(), now);
     }
 
+    /// The current expiry window (dynamic option), for stats.
+    pub fn max_age(&self) -> u64 {
+        self.max_age
+    }
+
+    /// Entry counts (policies, node disables) as stored; expired
+    /// entries linger until the next snapshot prunes them.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.policies.len(), self.disabled_nodes.len())
+    }
+
     /// Prune expired entries and return the survivors for
     /// application to a request layer.
     pub fn snapshot(&mut self, now: u64) -> (Vec<(String, ChanUpdate)>, Vec<String>) {

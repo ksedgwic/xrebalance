@@ -112,6 +112,11 @@ impl Coalescer {
         );
     }
 
+    /// Cache entry count, for stats.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Drop entries idle past the aging window, so the cache does
     /// not grow with the set of channel-dirs seen over the process
     /// lifetime.  Amortised: swept once per 4096 emits.
