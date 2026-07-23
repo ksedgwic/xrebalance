@@ -540,8 +540,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             0
         };
         log::debug!(
-            "req {req}: part {}/{} complete: delivered {}msat fee {}msat \
-             ({}ppm)",
+            "req {req}: part {:>2}/{:>2} complete: delivered {:>10} msat \
+             fee {:>7} msat ({:>6} ppm)",
             part.part_index,
             part.parts_total,
             eng(part.delivered_msat()),
@@ -560,8 +560,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         let planned_fee =
             part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
-            "req {req}: part {}/{} failed{geometry}{code}, planned {}msat \
-             ({}ppm)",
+            "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
+             {} msat ({:>6} ppm)",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
