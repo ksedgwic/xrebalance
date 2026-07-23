@@ -509,12 +509,13 @@ async fn plan_in_layer(
         ) {
             log::debug!(
                 "req {}: pruning part over the fee rate cap: {}msat on \
-                 {}msat delivered (budget {}msat on {}msat)",
+                 {}msat delivered (budget {}msat on {}msat) ({}ppm)",
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_fee),
                 crate::eng(route_delivered),
                 crate::eng(maxfee_msat),
                 crate::eng(params.amount_msat),
+                crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
             );
             continue;
         }

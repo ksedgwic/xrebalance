@@ -557,11 +557,15 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             Some(c) => format!(": {} ({c:#x})", failcode_name(c)),
             None => String::new(),
         };
+        let planned_fee =
+            part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
-            "req {req}: part {}/{} failed{geometry}{code}, planned {}msat",
+            "req {req}: part {}/{} failed{geometry}{code}, planned {}msat \
+             ({}ppm)",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
+            eng(fee_ppm(planned_fee, part.planned_msat).unwrap_or(0)),
         );
     }
     let mut payload = part.json();
