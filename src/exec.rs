@@ -35,7 +35,7 @@ use crate::onion_error::{
     classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate,
     FeeFault,
 };
-use crate::plan::{PlanResult, PERSISTENT_LAYER};
+use crate::plan::{fee_ppm, PlanResult, PERSISTENT_LAYER};
 use crate::{eng, Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
@@ -868,6 +868,7 @@ fn render(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Value
         "planned_fee_msat": plan.fee_msat,
         "delivered_msat": delivered,
         "fee_msat": fee,
+        "fee_ppm": fee_ppm(fee, delivered),
         "pending_msat": pending,
         "detail": plan.detail,
         "parts": parts.iter().map(Part::json).collect::<Vec<_>>(),

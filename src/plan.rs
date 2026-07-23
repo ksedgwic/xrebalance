@@ -73,6 +73,7 @@ pub fn dryrun_response(params: &XRebalanceParams, plan: &PlanResult) -> Value {
         "maxfee_msat": plan.maxfee_msat,
         "delivered_msat": plan.delivered_msat,
         "fee_msat": plan.fee_msat,
+        "fee_ppm": fee_ppm(plan.fee_msat, plan.delivered_msat),
         "routes": plan.routes,
         "detail": plan.detail,
     })
@@ -96,6 +97,15 @@ fn dir(from: &str, to: &str) -> u64 {
     } else {
         1
     }
+}
+
+/// Effective fee rate in ppm of what was delivered; None until
+/// anything is.
+pub fn fee_ppm(fee_msat: u64, delivered_msat: u64) -> Option<u64> {
+    if delivered_msat == 0 {
+        return None;
+    }
+    Some((u128::from(fee_msat) * 1_000_000 / u128::from(delivered_msat)) as u64)
 }
 
 /// Whether one part's fee honors the caller's fee rate
@@ -540,7 +550,18 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::part_within_rate;
+    use super::{fee_ppm, part_within_rate};
+
+    // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
+    #[test]
+    fn fee_ppm_truncates() {
+        assert_eq!(fee_ppm(230_502, 50_000_000), Some(4610));
+    }
+
+    #[test]
+    fn fee_ppm_none_until_delivery() {
+        assert_eq!(fee_ppm(0, 0), None);
+    }
 
     // Budget 100msat on 1_000_000msat = 100ppm; a part delivering
     // 100_000msat may charge at most 10msat.
