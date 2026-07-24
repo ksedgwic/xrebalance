@@ -129,9 +129,12 @@ fn read_bigsize(data: &[u8], pos: &mut usize) -> Option<u64> {
 /// Parse a BOLT 4 onion failure payload (the `raw_message` hex from
 /// sendpay failure data) and extract the embedded channel_update.
 /// None if the hex is malformed, the failcode does not carry a
-/// channel_update, the payload is truncated, or the update carries
-/// an absurd policy (proportional fee above 100% -- never a policy
-/// we would pay, and bounding it here is the overflow guarantee
+/// channel_update, the payload is truncated, the update is blanked
+/// (timestamp 0 -- privacy-conscious forwarders zero the embedded
+/// update rather than report their policy; real updates never
+/// carry timestamp 0), or the update carries an absurd policy
+/// (proportional fee above 100% -- never a policy we would pay,
+/// and bounding it here is the overflow guarantee
 /// classify_fee_insufficient relies on).
 ///
 /// Wire layout for the relevant failcodes:
@@ -181,6 +184,10 @@ pub fn parse_chan_update(raw_message_hex: &str) -> Option<ChanUpdate> {
     // 4 fee_base_msat + 4 fee_proportional_millionths + 8
     // htlc_maximum_msat = 136.
     if cu.len() < 136 {
+        return None;
+    }
+    // A blanked update: no timestamp means no signed policy.
+    if read_be(cu, 104, 4) == 0 {
         return None;
     }
     let out = ChanUpdate {
@@ -233,7 +240,8 @@ mod tests {
     }
 
     /// A 136-byte channel_update body (no type prefix),
-    /// sig..timestamp zeroed.
+    /// sig..short_channel_id zeroed, plausible timestamp (the
+    /// parser rejects timestamp 0 as a blanked update).
     fn make_cu_body(
         disabled: bool,
         cltv: u16,
@@ -243,6 +251,7 @@ mod tests {
         htlc_max: u64,
     ) -> Vec<u8> {
         let mut b = vec![0u8; 110];
+        b[104..108].copy_from_slice(&1_700_000_000u32.to_be_bytes());
         b[109] = if disabled { 0x02 } else { 0x00 };
         push_be(&mut b, u64::from(cltv), 2);
         push_be(&mut b, htlc_min, 8);
@@ -365,6 +374,23 @@ mod tests {
         let cu = parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
             .unwrap();
         assert!(!cu.enabled);
+    }
+
+    #[test]
+    fn blanked_update_rejected() {
+        // The 128-byte all-zero form seen in the wild (legacy
+        // layout, no htlc_maximum_msat).
+        let body = vec![0u8; 128];
+        assert!(
+            parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
+                .is_none()
+        );
+        // A full-size zeroed body falls to the timestamp check.
+        let body = vec![0u8; 136];
+        assert!(
+            parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
+                .is_none()
+        );
     }
 
     #[test]

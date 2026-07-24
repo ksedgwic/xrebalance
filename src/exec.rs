@@ -280,7 +280,8 @@ async fn inform(
 /// "carried fine" and "excluded" about the same hop.
 ///
 /// Policy-carrying failures: store the embedded update as an
-/// override for future request layers (apply_policy_refresh).
+/// override for future request layers, or exclude the direction
+/// when the forwarder blanked the update (apply_policy_refresh).
 ///
 /// Node-level failures: disable the forwarder for a while -- but
 /// never our own node, which in a circular rebalance is also the
@@ -493,6 +494,11 @@ async fn store_or_escalate(
 /// A failure naming the outgoing channel's published policy: our
 /// gossip view is behind what the forwarder enforces.  Store the
 /// embedded update as an override for future request layers.
+///
+/// With no usable update (privacy-conscious forwarders blank it),
+/// the policy cannot be refreshed; exclude the direction instead
+/// (constrained at 1msat, aging out) -- otherwise askrene keeps
+/// re-proposing a channel the forwarder just refused.
 async fn apply_policy_refresh(
     state: &State,
     rpc: &mut ClnRpc,
@@ -500,11 +506,19 @@ async fn apply_policy_refresh(
     erring_idx: usize,
     data: &Value,
 ) {
+    let erring = &part.hops[erring_idx];
     let Some(cu) = data["raw_message"].as_str().and_then(parse_chan_update)
     else {
+        if !erring.ours {
+            inform(state, rpc, &erring.scidd, 1, "constrained").await;
+            log::trace!(
+                "{}: policy failure with blanked update; excluded",
+                erring.scidd
+            );
+        }
         return;
     };
-    store_or_escalate(state, rpc, &part.hops[erring_idx], cu).await;
+    store_or_escalate(state, rpc, erring, cu).await;
 }
 
 /// Log a per-hop breakdown of a part's route: the amount entering
