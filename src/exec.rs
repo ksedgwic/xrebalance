@@ -654,6 +654,7 @@ pub async fn execute(
     plugin: &Plugin<State>,
     params: &XRebalanceParams,
     plan: &PlanResult,
+    started: std::time::Instant,
 ) -> Result<Value, Error> {
     let state = plugin.state();
     let mut parts: Vec<Part> = Vec::new();
@@ -848,6 +849,29 @@ pub async fn execute(
                 }
                 _ => {}
             }
+        }
+    }
+
+    // One line marking the end of the snapshot window: how long the
+    // request has run and whether anything is still in flight (a
+    // part settling later only shows up minutes down the log).
+    if !parts.is_empty() {
+        let req = params.label.as_deref().unwrap_or("?");
+        let outstanding =
+            parts.iter().filter(|p| p.status == "pending").count();
+        let elapsed = started.elapsed().as_secs_f64();
+        if outstanding == 0 {
+            log::debug!(
+                "req {req}: all {} part(s) settled, {elapsed:.1}s into \
+                 the request",
+                parts.len(),
+            );
+        } else {
+            log::debug!(
+                "req {req}: stopped waiting {elapsed:.1}s into the \
+                 request, {outstanding} of {} part(s) still in flight",
+                parts.len(),
+            );
         }
     }
 

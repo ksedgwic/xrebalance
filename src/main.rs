@@ -244,6 +244,7 @@ async fn xrebalance(
     _plugin: Plugin<State>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
+    let started = std::time::Instant::now();
     let mut parsed: XRebalanceParams = serde_json::from_value(params)
         .map_err(|e| anyhow!("invalid parameters: {e} (pass parameters by keyword)"))?;
     if parsed.label.is_none() {
@@ -309,7 +310,7 @@ async fn xrebalance(
     if parsed.dryrun.unwrap_or(false) {
         return Ok(plan::dryrun_response(&parsed, &planned));
     }
-    exec::execute(&_plugin, &parsed, &planned).await
+    exec::execute(&_plugin, &parsed, &planned, started).await
 }
 
 /// Report the plugin's state in one place: what the persistent
