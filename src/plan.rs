@@ -673,6 +673,10 @@ async fn plan_in_layer(
     let mut delivered: u64 = 0;
     let mut sent: u64 = 0;
     let mut pruned_long: usize = 0;
+    // Fee-rate-pruned parts, summarized after the loop: their ppm
+    // rates (sorted for min/median/max) and foregone delivery.
+    let mut pruned_rate_ppm: Vec<u64> = Vec::new();
+    let mut pruned_rate_msat: u64 = 0;
     for mut route in solved_routes {
         let path = route["path"]
             .as_array_mut()
@@ -714,7 +718,11 @@ async fn plan_in_layer(
             rung_maxfee,
             rung_amount,
         ) {
-            log::debug!(
+            // Per-part detail at trace; the loop exit logs one
+            // summary line (an MCF solve can shed dozens of parts,
+            // mostly quantization slivers priced absurdly by base
+            // fees, and one line per sliver buries the log).
+            log::trace!(
                 "req {}: pruning part over the fee rate cap: {} msat on \
                  {} msat delivered (budget {} msat on {} msat) ({:>6} ppm)",
                 params.label.as_deref().unwrap_or("?"),
@@ -724,11 +732,30 @@ async fn plan_in_layer(
                 crate::eng(rung_amount),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
             );
+            pruned_rate_ppm.push(
+                fee_ppm(route_fee, route_delivered).unwrap_or(0),
+            );
+            pruned_rate_msat =
+                pruned_rate_msat.saturating_add(route_delivered);
             continue;
         }
         sent += route_sent;
         delivered += route_delivered;
         routes.push(route);
+    }
+    if !pruned_rate_ppm.is_empty() {
+        pruned_rate_ppm.sort_unstable();
+        log::debug!(
+            "req {}: pruned {} part(s) over the fee rate cap ({} msat \
+             foregone): {}/{}/{} ppm min/median/max vs {} ppm budget",
+            params.label.as_deref().unwrap_or("?"),
+            pruned_rate_ppm.len(),
+            crate::eng(pruned_rate_msat),
+            crate::eng(pruned_rate_ppm[0]),
+            crate::eng(pruned_rate_ppm[(pruned_rate_ppm.len() - 1) / 2]),
+            crate::eng(pruned_rate_ppm[pruned_rate_ppm.len() - 1]),
+            crate::eng(fee_ppm(rung_maxfee, rung_amount).unwrap_or(0)),
+        );
     }
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
