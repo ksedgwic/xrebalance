@@ -9,11 +9,13 @@
 //!     mirror (peer -> us_in) channel with a caller-allocated fake
 //!     scid, the real direction's fee/cltv policy, and capacity set
 //!     to the channel's actual receivable (local truth askrene's
-//!     own gossip view cannot know);
+//!     own gossip view cannot know), bounded by the caller's
+//!     per-destination cap;
 //!   - every real (peer -> us) direction is disabled, so no flow
 //!     can enter or transit the real us;
 //!   - every (us -> peer) direction not named in sources is
-//!     disabled, pinning the drain side;
+//!     disabled, pinning the drain side; a source's optional cap
+//!     becomes an extra max constraint on its drain direction;
 //!   - getroutes runs source=us, destination=us_in.
 //!
 //! The final hop of each returned route crosses a mirror scid we
@@ -47,6 +49,11 @@ pub const PERSISTENT_LAYER: &str = "xrebalance";
 
 /// The outcome of planning: translated, sendpay-ready routes.
 pub struct PlanResult {
+    /// The requested amount clamped to what the channels can carry
+    /// under their caps: min(amount, source bounds less the fee
+    /// budget, destination bounds), each channel's bound being
+    /// min(cap, live liquidity).
+    pub effective_amount_msat: u64,
     pub maxfee_msat: u64,
     pub delivered_msat: u64,
     pub fee_msat: u64,
@@ -70,6 +77,7 @@ pub fn dryrun_response(params: &XRebalanceParams, plan: &PlanResult) -> Value {
         "label": params.label,
         "dryrun": true,
         "amount_msat": params.amount_msat,
+        "effective_amount_msat": plan.effective_amount_msat,
         "maxfee_msat": plan.maxfee_msat,
         "delivered_msat": plan.delivered_msat,
         "fee_msat": plan.fee_msat,
@@ -82,6 +90,7 @@ pub fn dryrun_response(params: &XRebalanceParams, plan: &PlanResult) -> Value {
 /// One usable channel from listpeerchannels.
 struct Chan {
     peer_id: String,
+    spendable_msat: u64,
     receivable_msat: u64,
     /// The peer's advertised policy toward us, if known.
     remote_update: Option<Value>,
@@ -160,30 +169,94 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     let _ = state.self_id.set(self_id.clone());
 
     let chans = usable_channels(&mut rpc).await?;
-    for scid in params.sources.iter().chain(&params.destinations) {
+    for spec in params.sources.iter().chain(&params.destinations) {
+        let scid = &spec.scid;
         if !chans.contains_key(scid) {
             return Err(anyhow!(
                 "unknown channel {scid}: not ours, or not in CHANNELD_NORMAL"
             ));
         }
     }
-    for scid in &params.destinations {
-        if chans[scid].remote_update.is_none() {
+    for spec in &params.destinations {
+        if chans[&spec.scid].remote_update.is_none() {
             return Err(anyhow!(
-                "destination {scid}: peer's channel_update not yet seen; \
-                 cannot mirror its policy"
+                "destination {}: peer's channel_update not yet seen; \
+                 cannot mirror its policy",
+                spec.scid,
             ));
         }
+    }
+
+    // Clamp the requested amount to what the channels can carry:
+    // more than this is infeasible by local arithmetic alone, and
+    // the ppm fee budget must price the movable amount, not the ask.
+    let src_bound = params
+        .sources
+        .iter()
+        .map(|s| s.capped(chans[&s.scid].spendable_msat))
+        .fold(0u64, u64::saturating_add);
+    let dst_bound = params
+        .destinations
+        .iter()
+        .map(|d| d.capped(chans[&d.scid].receivable_msat))
+        .fold(0u64, u64::saturating_add);
+    // The source bound carries the fees too: what crosses a source
+    // channel is delivered PLUS everything downstream hops charge.
+    // Clamping delivery to the raw bound would go infeasible at the
+    // margin, so the fee budget is set aside on the source side
+    // first (worst case: every budgeted msat is spent).  The
+    // destination side needs no headroom -- the last hop delivers
+    // net of fees.
+    let src_movable = match (params.maxfee_msat, params.maxfee_ppm) {
+        (Some(msat), None) => src_bound.saturating_sub(msat),
+        (None, Some(ppm)) => u64::try_from(
+            u128::from(src_bound) * 1_000_000 / (1_000_000 + u128::from(ppm)),
+        )
+        .expect("shrunk from a u64"),
+        _ => unreachable!("validated by caller"),
+    };
+    let amount_msat = params.amount_msat.min(src_movable).min(dst_bound);
+    if amount_msat < params.amount_msat {
+        log::debug!(
+            "req {}: amount clamped to {}msat (requested {}, sources \
+             carry {} after fee headroom, destinations carry {})",
+            params.label.as_deref().unwrap_or("?"),
+            crate::eng(amount_msat),
+            crate::eng(params.amount_msat),
+            crate::eng(src_movable),
+            crate::eng(dst_bound),
+        );
     }
 
     let maxfee_msat = match (params.maxfee_msat, params.maxfee_ppm) {
         (Some(msat), None) => msat,
         (None, Some(ppm)) => {
-            u64::try_from(u128::from(params.amount_msat) * u128::from(ppm) / 1_000_000)
+            u64::try_from(u128::from(amount_msat) * u128::from(ppm) / 1_000_000)
                 .map_err(|_| anyhow!("maxfee_ppm overflow"))?
         }
         _ => unreachable!("validated by caller"),
     };
+
+    if amount_msat == 0 {
+        let side = if src_movable == 0 && dst_bound == 0 {
+            "sources (after fee headroom) and destinations leave"
+        } else if src_movable == 0 {
+            "sources (after fee headroom) leave"
+        } else {
+            "destinations leave"
+        };
+        return Ok(PlanResult {
+            effective_amount_msat: 0,
+            maxfee_msat,
+            delivered_msat: 0,
+            fee_msat: 0,
+            routes: vec![],
+            onion_scids: HashMap::new(),
+            detail: Some(format!(
+                "nothing can move: the {side} nothing within their limits"
+            )),
+        });
+    }
 
     ensure_persistent_layer(&mut rpc).await?;
     let cutoff =
@@ -210,7 +283,8 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     );
     call(&mut rpc, "askrene-create-layer", json!({"layer": split})).await?;
     let result = plan_in_layer(
-        &mut rpc, state, &split, &self_id, &chans, params, maxfee_msat,
+        &mut rpc, state, &split, &self_id, &chans, params, amount_msat,
+        maxfee_msat,
     )
     .await;
     // Best-effort cleanup; planning outcome takes precedence.
@@ -280,6 +354,7 @@ async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Erro
             scid.to_owned(),
             Chan {
                 peer_id: peer_id.to_owned(),
+                spendable_msat: ch["spendable_msat"].as_u64().unwrap_or(0),
                 receivable_msat: ch["receivable_msat"].as_u64().unwrap_or(0),
                 remote_update: ch["updates"]["remote"].as_object().is_some().then(|| ch["updates"]["remote"].clone()),
                 onion_scid: (private)
@@ -309,6 +384,7 @@ async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plan_in_layer(
     rpc: &mut ClnRpc,
     state: &State,
@@ -316,6 +392,7 @@ async fn plan_in_layer(
     self_id: &str,
     chans: &HashMap<String, Chan>,
     params: &XRebalanceParams,
+    amount_msat: u64,
     maxfee_msat: u64,
 ) -> Result<PlanResult, Error> {
     apply_overrides(rpc, state, split).await;
@@ -324,9 +401,13 @@ async fn plan_in_layer(
     // remembering fake scid/dir -> real scid/dir.
     let mut unsplit: HashMap<String, String> = HashMap::new();
     let mut onion_scids: HashMap<String, String> = HashMap::new();
-    for (n, scid) in params.destinations.iter().enumerate() {
+    for (n, dspec) in params.destinations.iter().enumerate() {
+        let scid = &dspec.scid;
         let chan = &chans[scid];
         let update = chan.remote_update.as_ref().expect("validated");
+        // Local truth bounded by the caller's cap: what the channel
+        // can still receive AND this request may deliver into it.
+        let receivable_msat = dspec.capped(chan.receivable_msat);
         let real_scidd = format!("{scid}/{}", dir(&chan.peer_id, self_id));
         if let Some(alias) = &chan.onion_scid {
             onion_scids.insert(real_scidd.clone(), alias.clone());
@@ -342,9 +423,7 @@ async fn plan_in_layer(
                 "source": chan.peer_id,
                 "destination": FAKE_US_IN,
                 "short_channel_id": mirror_scid,
-                // Local truth: what the channel can actually still
-                // receive, not its nominal capacity.
-                "capacity_msat": chan.receivable_msat,
+                "capacity_msat": receivable_msat,
             }),
         )
         .await?;
@@ -368,7 +447,7 @@ async fn plan_in_layer(
         // carry that onto the mirror, since otherwise the solver
         // applies its uniform prior to the mirror's capacity.  Same
         // cap as localchans (bounded by the peer's htlc maximum).
-        let known_msat = chan.receivable_msat.min(
+        let known_msat = receivable_msat.min(
             update["htlc_maximum_msat"].as_u64().unwrap_or(u64::MAX),
         );
         if known_msat > 0 {
@@ -400,6 +479,11 @@ async fn plan_in_layer(
 
     // Mask: no flow may enter the real us (all inbound dirs off),
     // and the drain side is pinned to the named sources.
+    let src_caps: HashMap<&str, Option<u64>> = params
+        .sources
+        .iter()
+        .map(|s| (s.scid.as_str(), s.max_msat))
+        .collect();
     for (scid, chan) in chans {
         call(
             rpc,
@@ -412,25 +496,52 @@ async fn plan_in_layer(
             }),
         )
         .await?;
-        if !params.sources.contains(scid) {
-            call(
-                rpc,
-                "askrene-update-channel",
-                json!({
-                    "layer": split,
-                    "short_channel_id_dir":
-                        format!("{scid}/{}", dir(self_id, &chan.peer_id)),
-                    "enabled": false,
-                }),
-            )
-            .await?;
+        let out_scidd = format!("{scid}/{}", dir(self_id, &chan.peer_id));
+        match src_caps.get(scid.as_str()) {
+            None => {
+                call(
+                    rpc,
+                    "askrene-update-channel",
+                    json!({
+                        "layer": split,
+                        "short_channel_id_dir": out_scidd,
+                        "enabled": false,
+                    }),
+                )
+                .await?;
+            }
+            // A binding source cap is one extra max constraint on
+            // the real drain direction.  Layers intersect
+            // constraints, and the solver resolves the resulting
+            // min > max contradiction with auto.localchans' exact
+            // spendable assertion by trusting the max ("assume min
+            // is wrong", mcf.c), so the effective liquidity becomes
+            // min(cap, spendable) -- reality binds when it is the
+            // smaller.  A cap of 0 excludes the source outright.
+            // The MCF quantizes flow into ~amount/1000 units and
+            // may sit one unit past a knowledge bound, so a cap is
+            // honored to routing granularity, not to the msat.
+            Some(Some(cap)) if *cap < chan.spendable_msat => {
+                call(
+                    rpc,
+                    "askrene-inform-channel",
+                    json!({
+                        "layer": split,
+                        "short_channel_id_dir": out_scidd,
+                        "amount_msat": cap + 1,
+                        "inform": "constrained",
+                    }),
+                )
+                .await?;
+            }
+            Some(_) => {}
         }
     }
 
     let mut getroutes = json!({
         "source": self_id,
         "destination": FAKE_US_IN,
-        "amount_msat": params.amount_msat,
+        "amount_msat": amount_msat,
         // Split layer LAST: its masks must override auto.localchans.
         "layers": ["auto.localchans", PERSISTENT_LAYER, split],
         "maxfee_msat": maxfee_msat,
@@ -472,6 +583,7 @@ async fn plan_in_layer(
                 raw
             };
             return Ok(PlanResult {
+                effective_amount_msat: amount_msat,
                 maxfee_msat,
                 delivered_msat: 0,
                 fee_msat: 0,
@@ -530,7 +642,7 @@ async fn plan_in_layer(
             route_fee,
             route_delivered,
             maxfee_msat,
-            params.amount_msat,
+            amount_msat,
         ) {
             log::debug!(
                 "req {}: pruning part over the fee rate cap: {} msat on \
@@ -539,7 +651,7 @@ async fn plan_in_layer(
                 crate::eng(route_fee),
                 crate::eng(route_delivered),
                 crate::eng(maxfee_msat),
-                crate::eng(params.amount_msat),
+                crate::eng(amount_msat),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
             );
             continue;
@@ -571,6 +683,7 @@ async fn plan_in_layer(
     };
 
     Ok(PlanResult {
+        effective_amount_msat: amount_msat,
         maxfee_msat,
         delivered_msat: delivered,
         fee_msat: fee,

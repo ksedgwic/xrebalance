@@ -8,6 +8,8 @@ authoritative xrebalance_part notifications (in-window and detached
 background watcher), and success feedback landing in the persistent
 layer.
 """
+import pytest
+from pyln.client import RpcError
 from pyln.testing.utils import only_one, wait_for
 
 
@@ -192,3 +194,119 @@ def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
     assert res['status'] == 'planned', res
     assert res['delivered_msat'] == 0, res
     assert res['routes'] == [], res
+
+
+def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
+                     part_subscriber):
+    """Per-scid caps: both syntax forms, the fee-aware amount clamp,
+    caps binding inside one multi-source solve, and the zero-cap
+    result.  Fee budget below: maxfee_msat=5000, so a binding source
+    bound loses exactly 5000 msat of headroom to fees.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    # String form on the source: the cap clamps the whole request,
+    # less the fee budget (the cap bounds what CROSSES the channel,
+    # fees included), and the response reports the clamp.
+    res = l1.rpc.xrebalance(sources=[f'{src}:60000'],
+                            destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert res['status'] == 'planned', res
+    assert res['effective_amount_msat'] == 55000, res
+    assert res['delivered_msat'] == 55000, res
+    # The plan honors the cap on the wire: delivered plus fees stays
+    # within what the source channel was allowed to carry.
+    assert res['delivered_msat'] + res['fee_msat'] <= 60000, res
+
+    # Object form on the destination: no fee headroom on that side
+    # (the last hop delivers net of fees).
+    res = l1.rpc.xrebalance(sources=[src],
+                            destinations=[{'scid': scid_fill,
+                                           'max_msat': 70000}],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert res['effective_amount_msat'] == 70000, res
+    assert res['delivered_msat'] == 70000, res
+
+    # No caps and ample liquidity: nothing is clamped.
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert res['effective_amount_msat'] == 100000, res
+
+    # A cap of 0 on the only source: zero moved is a result, not an
+    # error, and the detail names the binding side.
+    res = l1.rpc.xrebalance(sources=[{'scid': src, 'max_msat': 0}],
+                            destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert res['status'] == 'planned', res
+    assert res['delivered_msat'] == 0, res
+    assert res['routes'] == [], res
+    assert 'sources' in res['detail'], res
+
+    # A malformed limit is a parameter error.
+    with pytest.raises(RpcError, match='invalid limit'):
+        l1.rpc.xrebalance(sources=[f'{src}:12.5sat'],
+                          destinations=[scid_fill],
+                          amount_msat=100000, maxfee_msat=5000)
+
+    # Duplicate scids would make the caps ambiguous.
+    with pytest.raises(RpcError, match='duplicate source'):
+        l1.rpc.xrebalance(sources=[src, f'{src}:1000'],
+                          destinations=[scid_fill],
+                          amount_msat=100000, maxfee_msat=5000)
+
+    # Two sources with individual caps, one solve: the full amount is
+    # delivered while each source's first-hop flow (delivered plus
+    # downstream fees) stays under its own cap -- the property the
+    # caps exist for, enforced by the solver rather than post-hoc.
+    # The amount sits above askrene's ~1000-sat single-path
+    # threshold: below it the small-amount solver requires ONE path
+    # carrying everything, and no capped-below-the-amount source can
+    # provide that (nor could any split honor caps < amount).
+    scid_src2, _ = l1.fundchannel(l2)
+    caps = {src: 1_500_000, scid_src2: 3_000_000}
+    res = l1.rpc.xrebalance(
+        sources=[{'scid': s, 'max_msat': c} for s, c in caps.items()],
+        destinations=[scid_fill],
+        amount_msat=4_000_000, maxfee_msat=50_000, dryrun=True)
+    assert res['effective_amount_msat'] == 4_000_000, res
+    assert res['delivered_msat'] == 4_000_000, res
+    per_src = {s: 0 for s in caps}
+    for route in res['routes']:
+        first = route['path'][0]
+        scid0 = first['short_channel_id_dir'].split('/')[0]
+        assert scid0 in per_src, res
+        per_src[scid0] += first['amount_in_msat']
+    # askrene's MCF solves in ~amount/1000 quantization units and may
+    # sit one unit past a knowledge bound, so caps are honored to
+    # routing granularity rather than to the msat.
+    slop = 4_000_000 // 1000
+    for s, cap in caps.items():
+        assert per_src[s] <= cap + slop, (per_src, caps)
+    # The capped-tighter source cannot cover the amount alone, so the
+    # solve genuinely split.
+    assert sum(1 for v in per_src.values() if v > 0) == 2, per_src
+
+    # EXECUTE with a source cap: the settled outcome honors it too.
+    before = only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
+    res = l1.rpc.xrebalance(sources=[f'{src}:60000'],
+                            destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000)
+    assert res['status'] == 'executed', res
+    assert res['effective_amount_msat'] == 55000, res
+    assert res['delivered_msat'] == 55000, res
+    wait_for(lambda: only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
+        == before + 55000)

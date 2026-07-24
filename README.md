@@ -21,6 +21,10 @@ Design points:
 
 - **Plural sources and destinations.**  One min-cost-flow solve can
   drain several channels into several others.
+- **Per-channel caps.**  Any source or destination can carry a limit
+  on how much this request moves through it, asserted as an askrene
+  constraint so the solver plans around it rather than xrebalance
+  post-filtering routes.
 - **Partial success is the semantic.**  `amount_msat` is a ceiling;
   every settled part is banked liquidity; zero delivered is a
   result, not an error.
@@ -31,9 +35,38 @@ Design points:
 
 ## Interface (settling — subject to change)
 
-    xrebalance sources=[scid,...] destinations=[scid,...]
+    xrebalance sources=[src,...] destinations=[dst,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
                [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
+
+Each `src`/`dst` element names one of our channels, optionally with
+a cap on how much this request moves through it — at most that much
+drawn from a source, at most that much delivered into a destination.
+Three equivalent spellings:
+
+    "845123x1x0"                                  no cap
+    "845123x1x0:250000"                           cap in msat
+    "845123x1x0:250sat"                           msat/sat suffixes
+    {"scid": "845123x1x0", "max_msat": 250000}    object form
+
+The effective per-channel bound is always the **smaller** of the cap
+and the channel's live liquidity; a cap of 0 excludes the channel
+from this request.  A source's cap bounds what crosses the channel —
+delivered amount plus downstream fees — and the solver honors it to
+its routing granularity (about 0.1% of the amount), so treat caps as
+guardrails rather than exact accounting bounds.  Programs composing
+JSON (CLBOSS) should prefer the object form; the string forms are
+for humans at a CLI.
+
+`amount_msat` remains the request-wide ceiling.  The planner clamps
+it to what the channels can carry: the smaller of the summed source
+bounds — less the fee budget, since fees ride the source channels on
+top of the delivered amount — and the summed destination bounds.
+The clamped value is reported as `effective_amount_msat` in the
+response.  A `maxfee_ppm` budget prices the clamped amount, not the
+ask; `maxfee_msat` is absolute either way.  A convenient corollary:
+`amount_msat` larger than a source can carry now means "drain it",
+rather than planning nothing.
 
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.

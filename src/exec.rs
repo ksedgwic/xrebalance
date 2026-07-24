@@ -905,6 +905,7 @@ fn render(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Value
         "status": "executed",
         "label": params.label,
         "amount_msat": params.amount_msat,
+        "effective_amount_msat": plan.effective_amount_msat,
         "maxfee_msat": plan.maxfee_msat,
         "planned_msat": plan.delivered_msat,
         "planned_fee_msat": plan.fee_msat,

@@ -12,6 +12,7 @@ mod exec;
 mod onion_error;
 mod overrides;
 mod plan;
+mod spec;
 
 use anyhow::anyhow;
 use cln_plugin::options::{self, DefaultIntegerConfigOption};
@@ -121,12 +122,15 @@ pub struct State {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct XRebalanceParams {
-    /// Channels to drain (our outgoing scids).
-    sources: Vec<String>,
-    /// Channels to fill (our incoming scids).
-    destinations: Vec<String>,
+    /// Channels to drain (our outgoing scids), each with an optional
+    /// cap on how much this request draws from it (spec.rs).
+    sources: Vec<spec::ChanSpec>,
+    /// Channels to fill (our incoming scids), each with an optional
+    /// cap on how much this request delivers into it.
+    destinations: Vec<spec::ChanSpec>,
     /// Ceiling on the amount to move; partial delivery is the norm,
-    /// zero delivered is a result rather than an error.
+    /// zero delivered is a result rather than an error.  Clamped to
+    /// what the channels can carry under their caps (plan.rs).
     amount_msat: u64,
     /// Strict whole-request fee budget: exactly one of these.
     #[serde(default)]
@@ -260,6 +264,12 @@ async fn xrebalance(
         return Err(anyhow!(
             "sources and destinations must each name at least one channel"
         ));
+    }
+    if let Some(scid) = spec::find_duplicate(&parsed.sources) {
+        return Err(anyhow!("duplicate source {scid}"));
+    }
+    if let Some(scid) = spec::find_duplicate(&parsed.destinations) {
+        return Err(anyhow!("duplicate destination {scid}"));
     }
     if parsed.maxparts == Some(0) {
         return Err(anyhow!("maxparts must be at least 1"));
