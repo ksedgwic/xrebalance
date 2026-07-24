@@ -187,13 +187,16 @@ def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
     assert min(c['maximum_msat'] for c in cons) < 210_000_000, cons
 
     # The learned constraint reaches the next solve: the only route
-    # is now known infeasible at this amount, so nothing is planned.
+    # is now known infeasible at the full amount, so the planner
+    # descends the ladder and plans the first rung the constraint
+    # admits (3/4 of the ask) instead of returning nothing.
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
                             amount_msat=200_000_000, maxfee_msat=1_000_000,
                             dryrun=True)
     assert res['status'] == 'planned', res
-    assert res['delivered_msat'] == 0, res
-    assert res['routes'] == [], res
+    assert res['effective_amount_msat'] == 150_000_000, res
+    assert res['delivered_msat'] == 150_000_000, res
+    assert res['routes'] != [], res
 
 
 def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,

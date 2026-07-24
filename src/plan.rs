@@ -49,10 +49,12 @@ pub const PERSISTENT_LAYER: &str = "xrebalance";
 
 /// The outcome of planning: translated, sendpay-ready routes.
 pub struct PlanResult {
-    /// The requested amount clamped to what the channels can carry
-    /// under their caps: min(amount, source bounds less the fee
-    /// budget, destination bounds), each channel's bound being
-    /// min(cap, live liquidity).
+    /// The amount planning settled on: the request clamped to what
+    /// the channels can carry under their caps -- min(amount,
+    /// source bounds less the fee budget, destination bounds), each
+    /// channel's bound being min(cap, live liquidity) -- and then,
+    /// when no route existed at that amount, descended by the
+    /// ladder to what the network could actually carry.
     pub effective_amount_msat: u64,
     pub maxfee_msat: u64,
     pub delivered_msat: u64,
@@ -538,26 +540,89 @@ async fn plan_in_layer(
         }
     }
 
-    let mut getroutes = json!({
-        "source": self_id,
-        "destination": FAKE_US_IN,
-        "amount_msat": amount_msat,
-        // Split layer LAST: its masks must override auto.localchans.
-        "layers": ["auto.localchans", PERSISTENT_LAYER, split],
-        "maxfee_msat": maxfee_msat,
-        "final_cltv": 14,
-    });
-    if let Some(maxparts) = params.maxparts {
-        getroutes["maxparts"] = json!(maxparts);
+    // The descent ladder.  getroutes is all-or-nothing at the asked
+    // amount, and when the clamp binds at a bound -- especially the
+    // destination side, which carries no fee slack -- the ask sits
+    // exactly at the optimistic edge of what the network might
+    // carry: one thin corridor fails the whole solve even though
+    // most of the amount is movable.  On a no-route failure (205)
+    // the solve retries at smaller amounts, probing for what IS
+    // movable -- the plan-time face of "partial delivery is the
+    // norm".  A ppm budget re-derives per rung (the rate is what
+    // the caller fixed); an absolute msat budget stands as given.
+    // 206 (a route exists but costs too much) never descends: base
+    // fees weigh proportionally MORE at smaller amounts.
+    const LADDER: [(u64, u64); 5] = [(1, 1), (3, 4), (1, 2), (1, 4), (1, 8)];
+    let mut solved = None;
+    let mut rung_amount = amount_msat;
+    let mut rung_maxfee = maxfee_msat;
+    let mut last_raw = String::new();
+    let mut descended = false;
+    let mut prev_rung = 0u64;
+    for (num, den) in LADDER {
+        let rung = amount_msat * num / den;
+        if rung == 0 || rung == prev_rung {
+            break;
+        }
+        prev_rung = rung;
+        rung_amount = rung;
+        rung_maxfee = match (params.maxfee_msat, params.maxfee_ppm) {
+            (Some(msat), None) => msat,
+            (None, Some(ppm)) => u64::try_from(
+                u128::from(rung) * u128::from(ppm) / 1_000_000,
+            )
+            .expect("shrunk from a u64"),
+            _ => unreachable!("validated by caller"),
+        };
+        let mut getroutes = json!({
+            "source": self_id,
+            "destination": FAKE_US_IN,
+            "amount_msat": rung,
+            // Split layer LAST: its masks must override auto.localchans.
+            "layers": ["auto.localchans", PERSISTENT_LAYER, split],
+            "maxfee_msat": rung_maxfee,
+            "final_cltv": 14,
+        });
+        if let Some(maxparts) = params.maxparts {
+            getroutes["maxparts"] = json!(maxparts);
+        }
+        match call(rpc, "getroutes", getroutes).await {
+            Ok(v) => {
+                solved = Some(v);
+                break;
+            }
+            Err(e) => {
+                last_raw = e.to_string();
+                if !last_raw.contains("Error code 205") {
+                    break;
+                }
+                log::debug!(
+                    "req {}: no route at {} msat, descending the ladder",
+                    params.label.as_deref().unwrap_or("?"),
+                    crate::eng(rung),
+                );
+                descended = true;
+            }
+        }
     }
-    let solved = match call(rpc, "getroutes", getroutes).await {
-        Ok(v) => v,
+    let solved = match solved {
+        Some(v) => {
+            if rung_amount < amount_msat {
+                log::debug!(
+                    "req {}: ladder settled at {} msat (clamped ask {})",
+                    params.label.as_deref().unwrap_or("?"),
+                    crate::eng(rung_amount),
+                    crate::eng(amount_msat),
+                );
+            }
+            v
+        }
         // Infeasible is a RESULT, not an error: zero moved.  (Real
         // infrastructure failures -- askrene absent, malformed
         // request -- also land here in this first cut; the detail
         // string tells the caller which it was.)
-        Err(e) => {
-            let raw = e.to_string();
+        None => {
+            let raw = last_raw;
             // askrene's no-usable-paths diagnostic (205) names the
             // closest unusable path, which here means our own mask
             // layer and mirror scids -- internals this API never
@@ -575,9 +640,14 @@ async fn plan_in_layer(
                     .and_then(|s| s.split(':').next())
                     .map(|c| format!(" (getroutes {c})"))
                     .unwrap_or_default();
+                let nor = if descended {
+                    ", nor at smaller amounts"
+                } else {
+                    ""
+                };
                 format!(
                     "no usable route from the sources to the \
-                     destinations at this amount and budget{code}"
+                     destinations at this amount and budget{nor}{code}"
                 )
             } else {
                 raw
@@ -641,8 +711,8 @@ async fn plan_in_layer(
         if !part_within_rate(
             route_fee,
             route_delivered,
-            maxfee_msat,
-            amount_msat,
+            rung_maxfee,
+            rung_amount,
         ) {
             log::debug!(
                 "req {}: pruning part over the fee rate cap: {} msat on \
@@ -650,8 +720,8 @@ async fn plan_in_layer(
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_fee),
                 crate::eng(route_delivered),
-                crate::eng(maxfee_msat),
-                crate::eng(amount_msat),
+                crate::eng(rung_maxfee),
+                crate::eng(rung_amount),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
             );
             continue;
@@ -663,9 +733,9 @@ async fn plan_in_layer(
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
     // per part above, and re-checked here post-route.
-    if fee > maxfee_msat {
+    if fee > rung_maxfee {
         return Err(anyhow!(
-            "planned fee {fee}msat exceeds budget {maxfee_msat}msat"
+            "planned fee {fee}msat exceeds budget {rung_maxfee}msat"
         ));
     }
     let detail = if routes.is_empty() && n_solved > 0 {
@@ -683,8 +753,8 @@ async fn plan_in_layer(
     };
 
     Ok(PlanResult {
-        effective_amount_msat: amount_msat,
-        maxfee_msat,
+        effective_amount_msat: rung_amount,
+        maxfee_msat: rung_maxfee,
         delivered_msat: delivered,
         fee_msat: fee,
         routes,

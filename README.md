@@ -61,12 +61,31 @@ for humans at a CLI.
 `amount_msat` remains the request-wide ceiling.  The planner clamps
 it to what the channels can carry: the smaller of the summed source
 bounds — less the fee budget, since fees ride the source channels on
-top of the delivered amount — and the summed destination bounds.
-The clamped value is reported as `effective_amount_msat` in the
-response.  A `maxfee_ppm` budget prices the clamped amount, not the
-ask; `maxfee_msat` is absolute either way.  A convenient corollary:
-`amount_msat` larger than a source can carry now means "drain it",
-rather than planning nothing.
+top of the delivered amount — and the summed destination bounds.  A
+convenient corollary: `amount_msat` larger than a source can carry
+now means "drain it", rather than planning nothing.
+
+Routing is all-or-nothing at the asked amount, so when no route
+exists at the clamped amount (one thin corridor is enough, since a
+clamp at the destination bound requires saturating every
+destination exactly), the planner **descends a ladder** — retrying
+the solve at 3/4, 1/2, 1/4, then 1/8 of the amount — and plans the
+first amount the network can actually carry.  This is the plan-time
+face of "partial delivery is the norm".  The amount planning
+settled on (clamp, then ladder) is reported as
+`effective_amount_msat`; dryruns run the identical planner, so a
+dryrun's result is what execution would have pursued.
+
+Fee budgets under the ladder: a `maxfee_ppm` budget re-derives at
+each rung, so the *rate* you set holds at any size.  An absolute
+`maxfee_msat` budget stands as given at every rung — at smaller
+rungs it therefore permits a proportionally higher fee *rate*,
+up to the full budget on an eighth of the amount.  Prefer
+`maxfee_ppm` when the amount is a ceiling rather than a target;
+it is the consistent form under both clamping and descent.  A
+too-expensive result (getroutes 206) never descends: base fees
+weigh proportionally more at smaller amounts, so cheaper routes
+do not appear further down.
 
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.
