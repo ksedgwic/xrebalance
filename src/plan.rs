@@ -120,6 +120,19 @@ fn part_within_rate(
         <= u128::from(maxfee_msat) * u128::from(delivered_msat)
 }
 
+/// lightningd's sendpay crashes (SIGSEGV in serialize_onionpacket)
+/// when a route's per-hop TLV payloads overflow the fixed 1300-byte
+/// onion: create_onionpacket returns NULL and lightningd/pay.c uses
+/// it unchecked.  Observed at 25 and 26 hops in production.  The
+/// real limit is payload bytes, not hops; 20 leaves comfortable
+/// margin.  Remove once CLN rejects the route instead of crashing.
+const MAX_SAFE_HOPS: usize = 20;
+
+/// Whether one part's route is short enough to fit the onion.
+fn part_within_length(n_hops: usize) -> bool {
+    n_hops <= MAX_SAFE_HOPS
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -477,10 +490,22 @@ async fn plan_in_layer(
     let mut routes = Vec::with_capacity(n_solved);
     let mut delivered: u64 = 0;
     let mut sent: u64 = 0;
+    let mut pruned_long: usize = 0;
     for mut route in solved_routes {
         let path = route["path"]
             .as_array_mut()
             .ok_or_else(|| anyhow!("getroutes: route without path"))?;
+        if !part_within_length(path.len()) {
+            log::debug!(
+                "req {}: pruning part over the hop cap: {} hops > {} max \
+                 (CLN sphinx crash mitigation)",
+                params.label.as_deref().unwrap_or("?"),
+                path.len(),
+                MAX_SAFE_HOPS,
+            );
+            pruned_long += 1;
+            continue;
+        }
         let first = path.first().ok_or_else(|| anyhow!("empty path"))?;
         let route_sent = first["amount_in_msat"].as_u64().unwrap_or(0);
         let last = path.last_mut().ok_or_else(|| anyhow!("empty path"))?;
@@ -532,9 +557,15 @@ async fn plan_in_layer(
         ));
     }
     let detail = if routes.is_empty() && n_solved > 0 {
-        Some(format!(
-            "all {n_solved} planned parts exceeded the fee rate cap"
-        ))
+        Some(if pruned_long == 0 {
+            format!("all {n_solved} planned parts exceeded the fee rate cap")
+        } else {
+            format!(
+                "all {n_solved} planned parts pruned: {pruned_long} over \
+                 {MAX_SAFE_HOPS} hops, {} over the fee rate cap",
+                n_solved - pruned_long
+            )
+        })
     } else {
         None
     };
@@ -551,7 +582,7 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{fee_ppm, part_within_rate};
+    use super::{fee_ppm, part_within_length, part_within_rate};
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
     #[test]
@@ -584,6 +615,18 @@ mod tests {
     #[test]
     fn fee_without_delivery_is_pruned() {
         assert!(!part_within_rate(1, 0, 100, 1_000_000));
+    }
+
+    #[test]
+    fn at_the_hop_cap_is_within() {
+        assert!(part_within_length(20));
+    }
+
+    // 25 hops crashed lightningd on 2026-07-24; anything over the
+    // cap must be pruned, never sent.
+    #[test]
+    fn overlong_route_is_pruned() {
+        assert!(!part_within_length(21));
     }
 
     #[test]
