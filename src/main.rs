@@ -97,6 +97,26 @@ const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     multi: false,
 };
 
+/// How many plan-execute rounds one request may run (the
+/// per-request maxrounds overrides).  Each round replans the
+/// still-unmoved remainder against everything the earlier rounds'
+/// failures taught (constraints, exclusions, policy refreshes), the
+/// xpay ethos: keep trying until the amount moves or the request
+/// can prove it cannot.  A round that delivers nothing and learns
+/// nothing ends the loop early (the stall check), so the cap is a
+/// backstop for feedback bugs, not the usual exit.  Default 1:
+/// exactly the old single-shot behavior.
+const OPT_MAX_ROUNDS: DefaultIntegerConfigOption =
+    DefaultIntegerConfigOption {
+        name: "xrebalance-max-rounds",
+        default: 1,
+        description: "plan-execute rounds one request may run (per-request \
+                      maxrounds overrides)",
+        deprecated: false,
+        dynamic: true,
+        multi: false,
+    };
+
 /// Notification topic: one event per part reaching a terminal state,
 /// carrying the part's own payment_hash (parts are independent
 /// payments, not an MPP set), part_index, first-hop scid, real
@@ -129,6 +149,18 @@ pub struct State {
     /// Fragment floor: least msat a planned part may deliver
     /// (dynamic; read per request).
     pub min_part_msat: Arc<AtomicU64>,
+    /// Round cap for the tenacious loop (dynamic; read per
+    /// request).
+    pub max_rounds: Arc<AtomicU64>,
+    /// One request at a time: concurrent requests would race each
+    /// other for the same liquidity and re-learn the same failures,
+    /// so non-dryrun requests queue here.
+    pub request_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Counts every feedback write (informs, exclusions, policy
+    /// stores, node disables).  A round that moves nothing and
+    /// leaves this unchanged would replan identically: the loop
+    /// stops instead (the stall check).
+    pub feedback_writes: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
@@ -140,7 +172,7 @@ pub struct State {
     pub self_id: Arc<OnceLock<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct XRebalanceParams {
     /// Channels to drain (our outgoing scids), each with an optional
@@ -169,6 +201,11 @@ pub struct XRebalanceParams {
     dryrun: Option<bool>,
     #[serde(default)]
     maxparts: Option<u32>,
+    /// Plan-execute rounds this request may run; each round replans
+    /// the remainder with everything earlier failures taught.
+    /// Defaults to the xrebalance-max-rounds option.
+    #[serde(default)]
+    maxrounds: Option<u32>,
     /// Snapshot-window override: seconds the response waits for
     /// parts, 0 to return immediately.  Defaults to the
     /// xrebalance-part-wait option.  Results stream via the
@@ -214,6 +251,7 @@ async fn run() -> Result<(), Error> {
         .option(OPT_OVERRIDE_AGE)
         .option(OPT_PART_WAIT)
         .option(OPT_MIN_PART)
+        .option(OPT_MAX_ROUNDS)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
         .rpcmethod(
             "xrebalance",
@@ -243,11 +281,18 @@ async fn run() -> Result<(), Error> {
         .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?;
     let min_part = u64::try_from(configured.option(&OPT_MIN_PART)?)
         .map_err(|_| anyhow!("xrebalance-min-part-msat must not be negative"))?;
+    let max_rounds = u64::try_from(configured.option(&OPT_MAX_ROUNDS)?)
+        .ok()
+        .filter(|&r| r >= 1)
+        .ok_or_else(|| anyhow!("xrebalance-max-rounds must be at least 1"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
         constraint_age: Arc::new(AtomicU64::new(constraint_age)),
         part_wait_secs: Arc::new(AtomicU64::new(part_wait)),
         min_part_msat: Arc::new(AtomicU64::new(min_part)),
+        max_rounds: Arc::new(AtomicU64::new(max_rounds)),
+        request_gate: Arc::new(tokio::sync::Mutex::new(())),
+        feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
             constraint_age,
@@ -260,12 +305,13 @@ async fn run() -> Result<(), Error> {
     let plugin = configured.start(state).await?;
     log::info!(
         "xrebalance v{} started: constraint-age {}s, override-age {}s, \
-         part-wait {}s, min-part {}msat",
+         part-wait {}s, min-part {}msat, max-rounds {}",
         env!("CARGO_PKG_VERSION"),
         eng(constraint_age),
         eng(override_age),
         eng(part_wait),
         eng(min_part),
+        eng(max_rounds),
     );
     plugin.join().await
 }
@@ -300,6 +346,9 @@ async fn xrebalance(
     if parsed.maxparts == Some(0) {
         return Err(anyhow!("maxparts must be at least 1"));
     }
+    if parsed.maxrounds == Some(0) {
+        return Err(anyhow!("maxrounds must be at least 1"));
+    }
     if parsed.amount_msat == 0 {
         return Err(anyhow!("amount_msat must be positive"));
     }
@@ -332,21 +381,161 @@ async fn xrebalance(
         },
     );
     let state = _plugin.state();
-    let planned = plan::plan(state, &parsed).await?;
-    if planned.routes.is_empty() {
-        log::debug!(
-            "req {}: no parts: {}",
-            parsed.label.as_deref().unwrap_or("?"),
-            planned
-                .detail
-                .as_deref()
-                .unwrap_or("planner returned no routes"),
-        );
-    }
     if parsed.dryrun.unwrap_or(false) {
+        let planned = plan::plan(state, &parsed).await?;
+        if planned.routes.is_empty() {
+            log::debug!(
+                "req {}: no parts: {}",
+                parsed.label.as_deref().unwrap_or("?"),
+                planned
+                    .detail
+                    .as_deref()
+                    .unwrap_or("planner returned no routes"),
+            );
+        }
         return Ok(plan::dryrun_response(&parsed, &planned));
     }
-    exec::execute(&_plugin, &parsed, &planned, started).await
+
+    // The tenacious loop: replan the still-unmoved remainder each
+    // round, against everything the earlier rounds' failures taught.
+    // With maxrounds 1 (the default) this is exactly the old
+    // single-shot request, response shape included.
+    let rounds_max = parsed
+        .maxrounds
+        .map(u64::from)
+        .unwrap_or_else(|| state.max_rounds.load(Ordering::Relaxed))
+        .max(1);
+    // One request at a time (see State.request_gate); the RPC
+    // blocking through the rounds is what paces a sequential driver.
+    let _gate = state.request_gate.lock().await;
+    let req = parsed.label.clone().unwrap_or_else(|| "?".into());
+    let mut rounds: Vec<serde_json::Value> = Vec::new();
+    let mut delivered_total: u64 = 0;
+    let mut fee_total: u64 = 0;
+    let mut pending_total: u64 = 0;
+    let mut pending_fee_total: u64 = 0;
+    let mut round: u64 = 0;
+    let stop_reason: String;
+    loop {
+        round += 1;
+        // Amounts still in flight count as committed: if a straggler
+        // later fails, this request under-delivers rather than
+        // double-spending its liquidity on a retry.
+        let committed = delivered_total.saturating_add(pending_total);
+        let remaining = parsed.amount_msat.saturating_sub(committed);
+        if round > 1 {
+            let floor = state.min_part_msat.load(Ordering::Relaxed).max(1);
+            if remaining < floor {
+                stop_reason = if remaining == 0 {
+                    "amount fully committed".into()
+                } else {
+                    format!(
+                        "remaining {}msat below the fragment floor",
+                        eng(remaining)
+                    )
+                };
+                break;
+            }
+        }
+        let mut round_params = parsed.clone();
+        round_params.amount_msat = remaining;
+        if let Some(pot) = parsed.maxfee_msat {
+            // An absolute budget is one pot across the rounds:
+            // settled and reserved (pending-part) fees come off it.
+            round_params.maxfee_msat = Some(
+                pot.saturating_sub(fee_total.saturating_add(pending_fee_total)),
+            );
+        }
+        let fb_before = state.feedback_writes.load(Ordering::Relaxed);
+        let planned = match plan::plan(state, &round_params).await {
+            Ok(p) => p,
+            // A later round must not turn work already done into an
+            // RPC error; report what happened instead.
+            Err(e) if round > 1 => {
+                stop_reason = format!("round {round} planning failed: {e}");
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let no_routes = planned.routes.is_empty();
+        if no_routes {
+            log::debug!(
+                "req {req}: no parts: {}",
+                planned
+                    .detail
+                    .as_deref()
+                    .unwrap_or("planner returned no routes"),
+            );
+        }
+        let outcome =
+            match exec::execute(&_plugin, &round_params, &planned, started)
+                .await
+            {
+                Ok(o) => o,
+                Err(e) if round > 1 => {
+                    stop_reason =
+                        format!("round {round} execution failed: {e}");
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+        delivered_total += outcome.delivered_msat;
+        fee_total += outcome.fee_msat;
+        pending_total += outcome.pending_msat;
+        pending_fee_total += outcome.pending_fee_msat;
+        rounds.push(outcome.response);
+        if rounds_max > 1 {
+            log::debug!(
+                "req {req}: round {round}/{rounds_max}: delivered {} msat \
+                 this round ({} total), {} msat pending, {} msat remaining",
+                eng(outcome.delivered_msat),
+                eng(delivered_total),
+                eng(pending_total),
+                eng(parsed.amount_msat.saturating_sub(
+                    delivered_total.saturating_add(pending_total)
+                )),
+            );
+        }
+        if no_routes {
+            stop_reason = format!(
+                "no further routes: {}",
+                planned.detail.as_deref().unwrap_or("planner returned none")
+            );
+            break;
+        }
+        if round >= rounds_max {
+            stop_reason = "round limit".into();
+            break;
+        }
+        if outcome.delivered_msat == 0
+            && outcome.pending_msat == 0
+            && state.feedback_writes.load(Ordering::Relaxed) == fb_before
+        {
+            // Nothing moved and nothing was learned: the next solve
+            // would be identical.
+            stop_reason = "stalled: a round moved nothing and learned \
+                           nothing"
+                .into();
+            break;
+        }
+    }
+    if rounds_max == 1 {
+        // Single-shot compatibility: the old response, exactly.
+        return Ok(rounds.pop().expect("round 1 always executes"));
+    }
+    log::debug!("req {req}: finished after {round} round(s): {stop_reason}");
+    Ok(serde_json::json!({
+        "status": "executed",
+        "label": parsed.label,
+        "amount_msat": parsed.amount_msat,
+        "rounds_run": rounds.len(),
+        "stop_reason": stop_reason,
+        "delivered_msat": delivered_total,
+        "fee_msat": fee_total,
+        "fee_ppm": plan::fee_ppm(fee_total, delivered_total),
+        "pending_msat": pending_total,
+        "rounds": rounds,
+    }))
 }
 
 /// Report the plugin's state in one place: what the persistent
@@ -455,6 +644,7 @@ async fn xrebalance_stats(
                 .max_age(),
             "part_wait": state.part_wait_secs.load(Ordering::Relaxed),
             "min_part_msat": state.min_part_msat.load(Ordering::Relaxed),
+            "max_rounds": state.max_rounds.load(Ordering::Relaxed),
         },
         "claims": claims,
         "coalescer_entries": coalescer,
@@ -509,6 +699,12 @@ async fn setconfig(
         }
         "xrebalance-min-part-msat" => {
             state.min_part_msat.store(value, Ordering::Relaxed);
+        }
+        "xrebalance-max-rounds" => {
+            if value < 1 {
+                return Err(anyhow!("{name} must be at least 1"));
+            }
+            state.max_rounds.store(value, Ordering::Relaxed);
         }
         _ => return Err(anyhow!("unknown dynamic option {name}")),
     }

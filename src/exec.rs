@@ -222,6 +222,13 @@ fn erring_hop_index(part: &Part, data: &Value) -> Option<usize> {
     })
 }
 
+/// Count one feedback write toward the request loop's stall check
+/// (main.rs): a round that moves nothing and bumps nothing would
+/// replan identically.
+fn note_feedback(state: &State) {
+    state.feedback_writes.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One best-effort inform-channel write into the persistent layer,
 /// coalesced: a bound already accepted this bucket and not tightened
 /// by this observation is dropped (coalesce.rs).
@@ -254,11 +261,14 @@ async fn inform(
         )
         .await
     {
-        Ok(_) => state
-            .coalescer
-            .lock()
-            .expect("coalescer lock")
-            .record(&key, bucket, amount_msat),
+        Ok(_) => {
+            state
+                .coalescer
+                .lock()
+                .expect("coalescer lock")
+                .record(&key, bucket, amount_msat);
+            note_feedback(state);
+        }
         Err(e) => log::trace!("inform {kind} {scidd}: {e}"),
     }
 }
@@ -364,6 +374,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                     .lock()
                     .expect("overrides lock")
                     .record_disabled_node(node, now_secs());
+                note_feedback(state);
                 log::trace!("node failure {failcode:#x}: disabling {node}");
                 return;
             }
@@ -398,6 +409,7 @@ fn record_exclusion(state: &State, scidd: &str) {
         .lock()
         .expect("overrides lock")
         .record_exclusion(scidd, now_secs());
+    note_feedback(state);
 }
 
 /// FEE_INSUFFICIENT (0x100c): the required fee at the erring node
@@ -497,17 +509,21 @@ fn store_or_escalate(state: &State, hop: &PartHop, cu: ChanUpdate) {
         return;
     }
     let now = now_secs();
-    let mut overrides = state.overrides.lock().expect("overrides lock");
-    if overrides.is_repeat(&hop.scidd, &cu, now) {
-        overrides.record_exclusion(&hop.scidd, now);
-        log::debug!(
-            "{}: enforcement diverges from its advertised policy; excluded",
-            hop.scidd
-        );
-        return;
+    {
+        let mut overrides = state.overrides.lock().expect("overrides lock");
+        if overrides.is_repeat(&hop.scidd, &cu, now) {
+            overrides.record_exclusion(&hop.scidd, now);
+            log::debug!(
+                "{}: enforcement diverges from its advertised policy; \
+                 excluded",
+                hop.scidd
+            );
+        } else {
+            overrides.record_policy(&hop.scidd, cu, now);
+            log::debug!("policy override stored for {}", hop.scidd);
+        }
     }
-    overrides.record_policy(&hop.scidd, cu, now);
-    log::debug!("policy override stored for {}", hop.scidd);
+    note_feedback(state);
 }
 
 /// A failure naming the outgoing channel's published policy: our
@@ -668,17 +684,47 @@ async fn background_watch(
     }
 }
 
+/// One round's executed outcome: the rendered response plus the
+/// totals the request loop (main.rs) accounts across rounds.
+pub struct ExecOutcome {
+    pub response: Value,
+    pub delivered_msat: u64,
+    pub fee_msat: u64,
+    /// Planned delivery of parts still in flight at the snapshot
+    /// close; the loop treats it as committed.
+    pub pending_msat: u64,
+    /// Planned fees of those in-flight parts, reserved against an
+    /// absolute (msat) budget.
+    pub pending_fee_msat: u64,
+}
+
+/// Bundle the terminal render with the cross-round totals.
+fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> ExecOutcome {
+    let pending: Vec<&Part> =
+        parts.iter().filter(|p| p.status == "pending").collect();
+    ExecOutcome {
+        delivered_msat: parts.iter().map(Part::delivered_msat).sum(),
+        fee_msat: parts.iter().map(Part::fee_msat).sum(),
+        pending_msat: pending.iter().map(|p| p.planned_msat).sum(),
+        pending_fee_msat: pending
+            .iter()
+            .map(|p| p.planned_sent_msat.saturating_sub(p.planned_msat))
+            .sum(),
+        response: render(params, plan, parts),
+    }
+}
+
 pub async fn execute(
     plugin: &Plugin<State>,
     params: &XRebalanceParams,
     plan: &PlanResult,
     started: std::time::Instant,
-) -> Result<Value, Error> {
+) -> Result<ExecOutcome, Error> {
     let state = plugin.state();
     let mut parts: Vec<Part> = Vec::new();
 
     if plan.routes.is_empty() {
-        return Ok(render(params, plan, &parts));
+        return Ok(outcome(params, plan, &parts));
     }
 
     // Prune stale claims once per request.
@@ -908,7 +954,7 @@ pub async fn execute(
         ));
     }
 
-    Ok(render(params, plan, &parts))
+    Ok(outcome(params, plan, &parts))
 }
 
 fn render(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Value {
@@ -949,6 +995,9 @@ mod tests {
             constraint_age: Arc::new(AtomicU64::new(6 * 60 * 60)),
             part_wait_secs: Arc::new(AtomicU64::new(0)),
             min_part_msat: Arc::new(AtomicU64::new(0)),
+            max_rounds: Arc::new(AtomicU64::new(1)),
+            request_gate: Arc::new(tokio::sync::Mutex::new(())),
+            feedback_writes: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),
             coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(
                 6 * 60 * 60,

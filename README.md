@@ -34,12 +34,20 @@ Design points:
   to a persistent askrene layer, policy facts (refreshes, node
   disables, channel exclusions) to a shorter-lived in-memory store
   -- so retries route better than first attempts.
+- **Tenacity.**  A request may run several plan-execute rounds
+  (`maxrounds`), each replanning the still-unmoved remainder
+  against what the earlier rounds' failures taught, until the
+  amount moves, the planner proves it cannot, or a round learns
+  nothing.  Non-dryrun requests serialize: one at a time, later
+  ones queue -- and the RPC blocks through the rounds, which is
+  what paces a sequential driver.
 
 ## Interface (settling — subject to change)
 
     xrebalance sources=[src,...] destinations=[dst,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
                [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
+               [maxrounds=N]
 
 Each `src`/`dst` element names one of our channels, optionally with
 a cap on how much this request moves through it — at most that much
@@ -118,6 +126,9 @@ setconfig`, so tuning never requires a plugin restart):
     xrebalance-part-wait=<seconds>        # default snapshot window (180)
     xrebalance-min-part-msat=<msat>       # fragment floor: least msat a
                                           # part may deliver (10000)
+    xrebalance-max-rounds=<n>             # plan-execute rounds per request
+                                          # (1; maxrounds overrides;
+                                          # ignored on dryrun)
 
 ## Build and run
 

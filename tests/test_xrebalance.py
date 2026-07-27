@@ -357,3 +357,36 @@ def test_min_part_floor(node_factory, bitcoind, xrebalance_plugin,
     # The dynamic value is visible in the stats.
     stats = l1.rpc.call('xrebalance-stats')
     assert stats['options']['min_part_msat'] == 60_000, stats
+
+
+def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
+                   part_subscriber):
+    """The tenacious loop: an ask beyond what the channels can carry
+    runs multiple rounds -- round 1 moves what fits, a later round
+    replans the remainder, finds the sources and destination
+    exhausted, and stops with a reason instead of an error.  The
+    multi-round response carries per-round snapshots plus request
+    totals; maxrounds=1 (the default) keeps the old shape.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    # Ask for roughly twice what the ~1M-sat corridor can carry.
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=2_000_000_000,
+                            maxfee_msat=100_000,
+                            maxrounds=5, label='tenacious')
+    assert res['status'] == 'executed', res
+    assert res['rounds_run'] == len(res['rounds']), res
+    assert 2 <= res['rounds_run'] <= 4, res
+    assert res['delivered_msat'] >= 500_000_000, res
+    assert res['stop_reason'], res
+    l1.daemon.wait_for_log(r"req tenacious: round 1/5: delivered")
+    l1.daemon.wait_for_log(r"req tenacious: finished after \d+ round")
