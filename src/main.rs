@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// balances; operators on slow networks (e.g. signet) should widen
 /// this to keep accumulated knowledge longer.
 ///
-/// All three options are dynamic (setconfig): restarting the plugin
+/// All the options are dynamic (setconfig): restarting the plugin
 /// to tune a knob would discard the very state being tuned -- the
 /// claim table (stranding in-flight parts), the learned overrides,
 /// and the coalescer cache.
@@ -79,6 +79,24 @@ const OPT_PART_WAIT: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     multi: false,
 };
 
+/// Minimum msat a planned part must deliver.  Applied as the
+/// htlc_minimum_msat of every destination mirror (plan.rs), so the
+/// solver itself never plans a part below it: askrene's refine
+/// stage drops sub-minimum flows and re-solves the remainder over
+/// other corridors.  Fragments -- fee-free quantization slivers
+/// riding truncated fee arithmetic -- carry no rebalance value at
+/// any price; this floor keeps them out of the plan entirely.
+/// 0 disables the floor.
+const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-min-part-msat",
+    default: 10_000,
+    description: "minimum msat a planned part must deliver (fragment \
+                  floor; 0 disables)",
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
+
 /// Notification topic: one event per part reaching a terminal state,
 /// carrying the part's own payment_hash (parts are independent
 /// payments, not an MPP set), part_index, first-hop scid, real
@@ -108,6 +126,9 @@ pub struct State {
     /// Bound on the synchronous part wait (dynamic; read per
     /// request).
     pub part_wait_secs: Arc<AtomicU64>,
+    /// Fragment floor: least msat a planned part may deliver
+    /// (dynamic; read per request).
+    pub min_part_msat: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
@@ -192,6 +213,7 @@ async fn run() -> Result<(), Error> {
         .option(OPT_CONSTRAINT_AGE)
         .option(OPT_OVERRIDE_AGE)
         .option(OPT_PART_WAIT)
+        .option(OPT_MIN_PART)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
         .rpcmethod(
             "xrebalance",
@@ -219,10 +241,13 @@ async fn run() -> Result<(), Error> {
         .map_err(|_| anyhow!("xrebalance-override-age must be positive"))?;
     let part_wait = u64::try_from(configured.option(&OPT_PART_WAIT)?)
         .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?;
+    let min_part = u64::try_from(configured.option(&OPT_MIN_PART)?)
+        .map_err(|_| anyhow!("xrebalance-min-part-msat must not be negative"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
         constraint_age: Arc::new(AtomicU64::new(constraint_age)),
         part_wait_secs: Arc::new(AtomicU64::new(part_wait)),
+        min_part_msat: Arc::new(AtomicU64::new(min_part)),
         claims: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
             constraint_age,
@@ -235,11 +260,12 @@ async fn run() -> Result<(), Error> {
     let plugin = configured.start(state).await?;
     log::info!(
         "xrebalance v{} started: constraint-age {}s, override-age {}s, \
-         part-wait {}s",
+         part-wait {}s, min-part {}msat",
         env!("CARGO_PKG_VERSION"),
         eng(constraint_age),
         eng(override_age),
         eng(part_wait),
+        eng(min_part),
     );
     plugin.join().await
 }
@@ -428,6 +454,7 @@ async fn xrebalance_stats(
                 .expect("overrides lock")
                 .max_age(),
             "part_wait": state.part_wait_secs.load(Ordering::Relaxed),
+            "min_part_msat": state.min_part_msat.load(Ordering::Relaxed),
         },
         "claims": claims,
         "coalescer_entries": coalescer,
@@ -454,35 +481,38 @@ async fn setconfig(
         .ok_or_else(|| anyhow!("setconfig: missing config name"))?
         .to_owned();
     let val = &v["val"];
-    let secs = val
+    let value = val
         .as_i64()
         .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
         .ok_or_else(|| anyhow!("{name}: value is not an integer"))?;
-    let secs = u64::try_from(secs)
+    let value = u64::try_from(value)
         .map_err(|_| anyhow!("{name} must not be negative"))?;
     let state = plugin.state();
     match name.as_str() {
         "xrebalance-constraint-age" => {
-            state.constraint_age.store(secs, Ordering::Relaxed);
+            state.constraint_age.store(value, Ordering::Relaxed);
             state
                 .coalescer
                 .lock()
                 .expect("coalescer lock")
-                .set_aging(secs);
+                .set_aging(value);
         }
         "xrebalance-override-age" => {
             state
                 .overrides
                 .lock()
                 .expect("overrides lock")
-                .set_max_age(secs);
+                .set_max_age(value);
         }
         "xrebalance-part-wait" => {
-            state.part_wait_secs.store(secs, Ordering::Relaxed);
+            state.part_wait_secs.store(value, Ordering::Relaxed);
+        }
+        "xrebalance-min-part-msat" => {
+            state.min_part_msat.store(value, Ordering::Relaxed);
         }
         _ => return Err(anyhow!("unknown dynamic option {name}")),
     }
-    plugin.set_option_str(&name, options::Value::Integer(secs as i64))?;
+    plugin.set_option_str(&name, options::Value::Integer(value as i64))?;
     Ok(json!({}))
 }
 

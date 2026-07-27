@@ -116,6 +116,8 @@ setconfig`, so tuning never requires a plugin restart):
                                           # policy refreshes, node disables,
                                           # channel exclusions (3600)
     xrebalance-part-wait=<seconds>        # default snapshot window (180)
+    xrebalance-min-part-msat=<msat>       # fragment floor: least msat a
+                                          # part may deliver (10000)
 
 ## Build and run
 

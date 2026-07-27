@@ -313,3 +313,47 @@ def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
     wait_for(lambda: only_one(
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
         == before + 55000)
+
+
+def test_min_part_floor(node_factory, bitcoind, xrebalance_plugin,
+                        part_subscriber):
+    """The fragment floor rides each destination mirror's
+    htlc_minimum_msat, so askrene itself never plans a part
+    delivering less: sub-floor flows are dropped in its refine
+    stage and the remainder re-solved.  A floor above every ladder
+    rung therefore yields no routes at all (the mirror is
+    unusable), and a floor below the ask leaves planning intact.
+    Dynamic: tuned via setconfig between requests.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    # Floor above the ask: every descent-ladder rung sits below the
+    # floor, so no part can be planned at any rung.
+    l1.rpc.setconfig('xrebalance-min-part-msat', 200_000)
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100_000, maxfee_msat=5_000,
+                            dryrun=True)
+    assert res['routes'] == [], res
+    assert res['delivered_msat'] == 0, res
+
+    # Floor below the ask: plans normally, and every planned part
+    # delivers at least the floor.
+    l1.rpc.setconfig('xrebalance-min-part-msat', 60_000)
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100_000, maxfee_msat=5_000,
+                            dryrun=True)
+    assert res['routes'], res
+    for route in res['routes']:
+        assert route['path'][-1]['amount_out_msat'] >= 60_000, res
+
+    # The dynamic value is visible in the stats.
+    stats = l1.rpc.call('xrebalance-stats')
+    assert stats['options']['min_part_msat'] == 60_000, stats

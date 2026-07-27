@@ -948,6 +948,7 @@ mod tests {
             rpc_path: PathBuf::new(),
             constraint_age: Arc::new(AtomicU64::new(6 * 60 * 60)),
             part_wait_secs: Arc::new(AtomicU64::new(0)),
+            min_part_msat: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),
             coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(
                 6 * 60 * 60,

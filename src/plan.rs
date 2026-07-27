@@ -10,7 +10,8 @@
 //!     scid, the real direction's fee/cltv policy, and capacity set
 //!     to the channel's actual receivable (local truth askrene's
 //!     own gossip view cannot know), bounded by the caller's
-//!     per-destination cap;
+//!     per-destination cap, with htlc_minimum raised to the
+//!     fragment floor (xrebalance-min-part-msat);
 //!   - every real (peer -> us) direction is disabled, so no flow
 //!     can enter or transit the real us;
 //!   - every (us -> peer) direction not named in sources is
@@ -446,6 +447,17 @@ async fn plan_in_layer(
             }),
         )
         .await?;
+        // The fragment floor (xrebalance-min-part-msat) rides the
+        // mirror's htlc_minimum_msat: every route crosses a mirror,
+        // and the amount crossing it is the part's delivered
+        // amount, so the solver itself refuses to plan a part
+        // delivering less -- its refine stage drops sub-minimum
+        // flows and re-solves the remainder over other corridors,
+        // no post-pruning needed.
+        let htlc_min_msat = update["htlc_minimum_msat"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(state.min_part_msat.load(Ordering::Relaxed));
         call(
             rpc,
             "askrene-update-channel",
@@ -453,7 +465,7 @@ async fn plan_in_layer(
                 "layer": split,
                 "short_channel_id_dir": mirror_scidd,
                 "enabled": true,
-                "htlc_minimum_msat": update["htlc_minimum_msat"],
+                "htlc_minimum_msat": htlc_min_msat,
                 "htlc_maximum_msat": update["htlc_maximum_msat"],
                 "fee_base_msat": update["fee_base_msat"],
                 "fee_proportional_millionths": update["fee_proportional_millionths"],
