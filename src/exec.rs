@@ -46,8 +46,9 @@ const WAITSENDPAY_TIMEOUT: i32 = 200;
 /// constraint.
 const WIRE_TEMPORARY_CHANNEL_FAILURE: u64 = 0x1007;
 
-/// BOLT 4 fee_insufficient (UPDATE|12): attributed to either the
-/// incoming channel's inbound fee or a stale outgoing policy
+/// BOLT 4 fee_insufficient (UPDATE|12): attributed to the incoming
+/// channel's inbound fee, a stale outgoing policy, or -- when the
+/// forwarder blanked the update -- neither side reliably
 /// (onion_error.rs).
 const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
 
@@ -60,9 +61,10 @@ const WIRE_POLICY_CARRYING: [u64; 4] = [0x100b, 0x100d, 0x100e, 0x1014];
 
 /// BOLT 4 unknown_next_peer (PERM|10): the forwarder has no usable
 /// next channel -- closed but still gossiped, or the peer is
-/// offline.  The direction is excluded (constrained at 1msat, aging
-/// out normally); otherwise askrene re-proposes it until the gossip
-/// catches up.
+/// offline.  The direction is excluded in the PERSISTENT layer
+/// (constrained at 1msat, aging on the constraint clock), unlike
+/// the policy-ish exclusions in the override store: a gone channel
+/// is not a gossip hiccup, so the longer expiry fits.
 const WIRE_UNKNOWN_NEXT_PEER: u64 = 0x400a;
 
 /// BOLT 4 NODE bit: the failure concerns the forwarder itself, not
@@ -261,8 +263,12 @@ async fn inform(
     }
 }
 
-/// Write a terminal part's outcome back to the persistent layer, so
-/// the next request's solve knows what this one learned.
+/// Write a terminal part's outcome back so the next request's solve
+/// knows what this one learned: liquidity facts (constrained /
+/// unconstrained at an amount) go to the persistent layer on the
+/// constraint clock; policy-ish facts (refreshes, node disables,
+/// exclusions) go to the in-memory override store on the shorter
+/// override clock.
 ///
 /// Success: every NETWORK hop demonstrably carried its amount --
 /// inform unconstrained.  Our own channels are excluded (first hop
@@ -362,13 +368,11 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 return;
             }
             if fee_insufficient {
-                apply_fee_insufficient(state, &mut rpc, part, erring_idx, data)
-                    .await;
+                apply_fee_insufficient(state, part, erring_idx, data);
                 return;
             }
             if policy_carrying {
-                apply_policy_refresh(state, &mut rpc, part, erring_idx, data)
-                    .await;
+                apply_policy_refresh(state, part, erring_idx, data);
                 return;
             }
             let erring = &part.hops[erring_idx];
@@ -384,6 +388,18 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
     }
 }
 
+/// Take a channel direction out of consideration for a while: an
+/// exclusion in the in-memory override store, written into each
+/// request's split layer as a 1msat constraint until it ages out
+/// (overrides.rs).
+fn record_exclusion(state: &State, scidd: &str) {
+    state
+        .overrides
+        .lock()
+        .expect("overrides lock")
+        .record_exclusion(scidd, now_secs());
+}
+
 /// FEE_INSUFFICIENT (0x100c): the required fee at the erring node
 /// is outbound_fee(erring/outgoing channel) + inbound_fee(incoming
 /// channel), but the error names and carries the policy of the
@@ -391,54 +407,58 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
 /// comparing the fee the route allocated against the advertised
 /// outbound policy (onion_error.rs).
 ///
-/// Inbound case: the incoming channel route[N-1] charges a bLIP-18
+/// InboundFee case: the incoming channel route[N-1] charges a bLIP-18
 /// inbound fee, which CLN cannot pay and askrene cannot price --
-/// exclude that channel (constrained at 1 msat; the constraint ages
-/// out, so the channel recovers if the peer later drops the fee).
-/// Never our own channel: auto.localchans owns local truth.
+/// exclude that channel for a while (the exclusion ages out, so
+/// the channel recovers if the peer later drops the fee).  Never
+/// our own channel: auto.localchans owns local truth.
 ///
 /// Stale-outbound case: our gossip view of the outgoing channel is
-/// stale.  Logged, no layer write -- the policy corrects itself
-/// when gossip catches up, and an exclusion here would indict a
-/// channel whose only offense is a fee we simply did not pay.
-async fn apply_fee_insufficient(
+/// stale.  Store the returned policy as an override; no exclusion
+/// -- it would indict a channel whose only offense is a fee we
+/// simply did not pay.
+///
+/// Unattributed case (blanked or absent update): a stale outbound
+/// policy and an inbound fee are indistinguishable, so exclude
+/// BOTH sides -- the outgoing channel, which gets no policy
+/// refresh and would otherwise be re-proposed every request until
+/// gossip catches up, and the incoming channel, whose inbound fee
+/// may be the true cause.  A wrong exclusion costs one candidate
+/// hop for one override-age and self-heals; not blocking the true
+/// offender costs a failed part per request, indefinitely.
+fn apply_fee_insufficient(
     state: &State,
-    rpc: &mut ClnRpc,
     part: &Part,
     erring_idx: usize,
     data: &Value,
 ) {
-    let out_msat = part.hops[erring_idx].amount_msat;
-    let alloc_msat = if erring_idx >= 1 {
-        part.hops[erring_idx - 1].amount_msat.saturating_sub(out_msat)
-    } else {
-        0
-    };
+    let erring = &part.hops[erring_idx];
+    let incoming = erring_idx.checked_sub(1).map(|i| &part.hops[i]);
+    let out_msat = erring.amount_msat;
+    let alloc_msat = incoming
+        .map(|h| h.amount_msat.saturating_sub(out_msat))
+        .unwrap_or(0);
     let update = data["raw_message"].as_str().and_then(parse_chan_update);
     match classify_fee_insufficient(alloc_msat, out_msat, update.as_ref()) {
-        FeeFault::Inbound => {
-            let Some(incoming) = erring_idx
-                .checked_sub(1)
-                .map(|i| &part.hops[i])
-                .filter(|h| !h.ours)
-            else {
+        FeeFault::InboundFee => {
+            let Some(incoming) = incoming.filter(|h| !h.ours) else {
                 return;
             };
-            inform(state, rpc, &incoming.scidd, 1, "constrained").await;
-            log::trace!(
+            record_exclusion(state, &incoming.scidd);
+            log::debug!(
                 "fee_insufficient at {}: attributed to an inbound fee on \
                  the incoming channel {}; excluded",
-                part.hops[erring_idx].scidd,
+                erring.scidd,
                 incoming.scidd,
             );
         }
         FeeFault::StaleOutbound => {
             let cu = update.expect("StaleOutbound implies an update");
-            log::trace!(
+            log::debug!(
                 "fee_insufficient at {}: stale outbound policy \
                  (allocated {}msat; advertised base={} prop={} \
                  min={} max={} cltv={} enabled={} inbound_fee={:?})",
-                part.hops[erring_idx].scidd,
+                erring.scidd,
                 eng(alloc_msat),
                 cu.fee_base_msat,
                 cu.fee_proportional_millionths,
@@ -448,7 +468,20 @@ async fn apply_fee_insufficient(
                 cu.enabled,
                 cu.inbound_fee,
             );
-            store_or_escalate(state, rpc, &part.hops[erring_idx], cu).await;
+            store_or_escalate(state, erring, cu);
+        }
+        FeeFault::Unattributed => {
+            for hop in
+                std::iter::once(erring).chain(incoming).filter(|h| !h.ours)
+            {
+                record_exclusion(state, &hop.scidd);
+                log::debug!(
+                    "fee_insufficient at {}: blanked or absent update; \
+                     excluded {}",
+                    erring.scidd,
+                    hop.scidd,
+                );
+            }
         }
     }
 }
@@ -457,38 +490,24 @@ async fn apply_fee_insufficient(
 /// layers, unless the forwarder returned the identical policy we
 /// already applied -- then another refresh changes nothing (its
 /// enforcement diverges from what it signs) and the channel is
-/// excluded instead, through the same aging constraint as any
-/// exclusion.  Our own channels are skipped: auto.localchans owns
-/// local truth.
-async fn store_or_escalate(
-    state: &State,
-    rpc: &mut ClnRpc,
-    hop: &PartHop,
-    cu: ChanUpdate,
-) {
+/// excluded instead.  Our own channels are skipped:
+/// auto.localchans owns local truth.
+fn store_or_escalate(state: &State, hop: &PartHop, cu: ChanUpdate) {
     if hop.ours {
         return;
     }
     let now = now_secs();
-    let repeat = state
-        .overrides
-        .lock()
-        .expect("overrides lock")
-        .is_repeat(&hop.scidd, &cu, now);
-    if repeat {
-        inform(state, rpc, &hop.scidd, 1, "constrained").await;
-        log::trace!(
+    let mut overrides = state.overrides.lock().expect("overrides lock");
+    if overrides.is_repeat(&hop.scidd, &cu, now) {
+        overrides.record_exclusion(&hop.scidd, now);
+        log::debug!(
             "{}: enforcement diverges from its advertised policy; excluded",
             hop.scidd
         );
         return;
     }
-    state
-        .overrides
-        .lock()
-        .expect("overrides lock")
-        .record_policy(&hop.scidd, cu, now);
-    log::trace!("policy override stored for {}", hop.scidd);
+    overrides.record_policy(&hop.scidd, cu, now);
+    log::debug!("policy override stored for {}", hop.scidd);
 }
 
 /// A failure naming the outgoing channel's published policy: our
@@ -496,12 +515,11 @@ async fn store_or_escalate(
 /// embedded update as an override for future request layers.
 ///
 /// With no usable update (privacy-conscious forwarders blank it),
-/// the policy cannot be refreshed; exclude the direction instead
-/// (constrained at 1msat, aging out) -- otherwise askrene keeps
-/// re-proposing a channel the forwarder just refused.
-async fn apply_policy_refresh(
+/// the policy cannot be refreshed; exclude the direction for a
+/// while instead -- otherwise askrene keeps re-proposing a channel
+/// the forwarder just refused.
+fn apply_policy_refresh(
     state: &State,
-    rpc: &mut ClnRpc,
     part: &Part,
     erring_idx: usize,
     data: &Value,
@@ -510,15 +528,15 @@ async fn apply_policy_refresh(
     let Some(cu) = data["raw_message"].as_str().and_then(parse_chan_update)
     else {
         if !erring.ours {
-            inform(state, rpc, &erring.scidd, 1, "constrained").await;
-            log::trace!(
+            record_exclusion(state, &erring.scidd);
+            log::debug!(
                 "{}: policy failure with blanked update; excluded",
                 erring.scidd
             );
         }
         return;
     };
-    store_or_escalate(state, rpc, erring, cu).await;
+    store_or_escalate(state, erring, cu);
 }
 
 /// Log a per-hop breakdown of a part's route: the amount entering
@@ -916,4 +934,148 @@ fn render(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Value
         "detail": plan.detail,
         "parts": parts.iter().map(Part::json).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn test_state() -> State {
+        State {
+            rpc_path: PathBuf::new(),
+            constraint_age: Arc::new(AtomicU64::new(6 * 60 * 60)),
+            part_wait_secs: Arc::new(AtomicU64::new(0)),
+            claims: Arc::new(Mutex::new(HashMap::new())),
+            coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(
+                6 * 60 * 60,
+            ))),
+            overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(
+                3600,
+            ))),
+            self_id: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn hop(scidd: &str, amount_msat: u64, ours: bool) -> PartHop {
+        PartHop {
+            scidd: scidd.to_owned(),
+            onion_scid: scidd.split_once('/').expect("scidd").0.to_owned(),
+            amount_msat,
+            ours,
+        }
+    }
+
+    fn part(hops: Vec<PartHop>) -> Part {
+        Part {
+            part_index: 1,
+            parts_total: 1,
+            payment_hash: "00".repeat(32),
+            first_hop: hops[0].scidd.clone(),
+            return_hop: hops[hops.len() - 1].scidd.clone(),
+            planned_msat: 0,
+            planned_sent_msat: 0,
+            hops,
+            status: "failed",
+            detail: None,
+            hops_short: None,
+            failcode: Some(WIRE_FEE_INSUFFICIENT),
+            erring_scidd: None,
+        }
+    }
+
+    /// The override store's current exclusions, sorted.
+    fn exclusions(state: &State) -> Vec<String> {
+        let mut v = state
+            .overrides
+            .lock()
+            .expect("overrides lock")
+            .snapshot(now_secs())
+            .exclusions;
+        v.sort();
+        v
+    }
+
+    fn cu(prop: u32) -> ChanUpdate {
+        ChanUpdate {
+            enabled: true,
+            cltv_expiry_delta: 144,
+            htlc_minimum_msat: 1000,
+            fee_base_msat: 0,
+            fee_proportional_millionths: prop,
+            htlc_maximum_msat: 1_000_000,
+            inbound_fee: None,
+        }
+    }
+
+    // An unattributable FEE_INSUFFICIENT (no raw_message, hence no
+    // update) blocks both sides of the erring node: the erring
+    // direction and the incoming channel.
+    #[test]
+    fn unattributed_fee_excludes_both_sides() {
+        let state = test_state();
+        let p = part(vec![
+            hop("100x1x0/0", 1_010, true),
+            hop("200x1x0/1", 1_005, false),
+            hop("300x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p, 2, &json!({}));
+        assert_eq!(exclusions(&state), vec!["200x1x0/1", "300x1x0/0"]);
+    }
+
+    // Our own channels are never excluded, each side judged
+    // independently: erring at our return hop still excludes the
+    // network incoming channel ...
+    #[test]
+    fn unattributed_fee_skips_our_channels_independently() {
+        let state = test_state();
+        let p = part(vec![
+            hop("100x1x0/0", 1_010, true),
+            hop("300x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p, 2, &json!({}));
+        assert_eq!(exclusions(&state), vec!["300x1x0/0"]);
+    }
+
+    // ... and a route of only our own hops excludes nothing.
+    #[test]
+    fn unattributed_fee_with_only_our_hops_excludes_nothing() {
+        let state = test_state();
+        let p = part(vec![
+            hop("100x1x0/0", 1_000, true),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p, 1, &json!({}));
+        assert!(exclusions(&state).is_empty());
+    }
+
+    // A forwarder returning the identical policy we already applied
+    // escalates to an exclusion instead of another no-op refresh.
+    #[test]
+    fn repeat_policy_escalates_to_exclusion() {
+        let state = test_state();
+        let h = hop("200x1x0/1", 1_000, false);
+        store_or_escalate(&state, &h, cu(10));
+        assert!(exclusions(&state).is_empty());
+        store_or_escalate(&state, &h, cu(10));
+        assert_eq!(exclusions(&state), vec!["200x1x0/1"]);
+    }
+
+    // A policy-carrying failure with a blanked update excludes the
+    // outgoing channel.
+    #[test]
+    fn blanked_policy_refresh_excludes_erring() {
+        let state = test_state();
+        let p = part(vec![
+            hop("100x1x0/0", 1_010, true),
+            hop("300x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_policy_refresh(&state, &p, 1, &json!({}));
+        assert_eq!(exclusions(&state), vec!["300x1x0/0"]);
+    }
 }

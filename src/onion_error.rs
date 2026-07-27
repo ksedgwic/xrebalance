@@ -64,13 +64,16 @@ impl ChanUpdate {
 /// channel only.
 pub enum FeeFault {
     /// The allocated fee covers the outgoing channel's advertised
-    /// policy, or there is no update to compare (a plain
-    /// stale-policy failure would carry one): the shortfall is the
-    /// INCOMING channel's inbound fee.
-    Inbound,
+    /// policy: the shortfall is the INCOMING channel's inbound fee.
+    InboundFee,
     /// The allocated fee falls short of the advertised outbound
     /// policy: our gossip view of the outgoing channel is stale.
     StaleOutbound,
+    /// No update to compare -- the forwarder blanked it, or the
+    /// payload was malformed -- so a stale outbound policy and an
+    /// inbound fee are indistinguishable; neither side can be
+    /// cleared.
+    Unattributed,
 }
 
 /// Attribute a FEE_INSUFFICIENT.  `alloc_msat` is the fee the route
@@ -82,14 +85,14 @@ pub fn classify_fee_insufficient(
     update: Option<&ChanUpdate>,
 ) -> FeeFault {
     let Some(cu) = update else {
-        return FeeFault::Inbound;
+        return FeeFault::Unattributed;
     };
     // The parser bounds proportional fees at 100%, so this cannot
     // wrap for any Lightning-plausible amount.
     let required = u64::from(cu.fee_base_msat)
         + u64::from(cu.fee_proportional_millionths) * out_msat / 1_000_000;
     if alloc_msat >= required {
-        FeeFault::Inbound
+        FeeFault::InboundFee
     } else {
         FeeFault::StaleOutbound
     }
@@ -434,10 +437,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_no_update_is_inbound() {
+    fn classify_no_update_is_unattributed() {
         assert!(matches!(
             classify_fee_insufficient(0, 1_000_000, None),
-            FeeFault::Inbound
+            FeeFault::Unattributed
         ));
     }
 
@@ -449,7 +452,7 @@ mod tests {
         // required = 100 + 500 * 1_000_000 / 1_000_000 = 600.
         assert!(matches!(
             classify_fee_insufficient(600, 1_000_000, Some(&cu)),
-            FeeFault::Inbound
+            FeeFault::InboundFee
         ));
         assert!(matches!(
             classify_fee_insufficient(599, 1_000_000, Some(&cu)),

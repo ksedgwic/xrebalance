@@ -296,16 +296,17 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 
 /// Write the still-young learned overrides (overrides.rs) into a
 /// request layer: policy refreshes as channel updates, failed
-/// forwarders as node disables.  Best-effort per entry -- a channel
-/// gone from gossip since we learned about it must not fail the
-/// plan, it just stops benefiting from the override.
+/// forwarders as node disables, exclusions as 1msat constraints.
+/// Best-effort per entry -- a channel gone from gossip since we
+/// learned about it must not fail the plan, it just stops
+/// benefiting from the override.
 async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
-    let (policies, nodes) = state
+    let snap = state
         .overrides
         .lock()
         .expect("overrides lock")
         .snapshot(now_secs());
-    for (scidd, cu) in policies {
+    for (scidd, cu) in snap.policies {
         if let Err(e) = call(
             rpc,
             "askrene-update-channel",
@@ -325,7 +326,7 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
             log::trace!("override {scidd}: {e}");
         }
     }
-    for node in nodes {
+    for node in snap.disabled_nodes {
         if let Err(e) = call(
             rpc,
             "askrene-disable-node",
@@ -334,6 +335,22 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         .await
         {
             log::trace!("override disable {node}: {e}");
+        }
+    }
+    for scidd in snap.exclusions {
+        if let Err(e) = call(
+            rpc,
+            "askrene-inform-channel",
+            json!({
+                "layer": layer,
+                "short_channel_id_dir": scidd,
+                "amount_msat": 1,
+                "inform": "constrained",
+            }),
+        )
+        .await
+        {
+            log::trace!("override exclusion {scidd}: {e}");
         }
     }
 }

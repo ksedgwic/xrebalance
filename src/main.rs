@@ -48,16 +48,16 @@ const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
     };
 
 /// Learned gossip overrides (policy refreshes from onion failures,
-/// node disables) expire after this many seconds.  A separate knob
-/// from the constraint age: overrides assert what a peer enforces
-/// rather than where liquidity sits, and the two decay on different
-/// clocks.
+/// node disables, channel exclusions) expire after this many
+/// seconds.  A separate knob from the constraint age: overrides
+/// assert what a peer enforces rather than where liquidity sits,
+/// and the two decay on different clocks.
 const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption =
     DefaultIntegerConfigOption {
         name: "xrebalance-override-age",
         default: 60 * 60,
-        description:
-            "seconds until learned policy and node-disable overrides expire",
+        description: "seconds until learned policy, node-disable, and \
+                      channel-exclusion overrides expire",
         deprecated: false,
         dynamic: true,
         multi: false,
@@ -336,7 +336,7 @@ async fn xrebalance_stats(
     let state = plugin.state();
     let claims = state.claims.lock().expect("claims lock").len();
     let coalescer = state.coalescer.lock().expect("coalescer lock").len();
-    let (policies, disabled_nodes) =
+    let (policies, disabled_nodes, exclusions) =
         state.overrides.lock().expect("overrides lock").counts();
 
     let mut rpc = cln_rpc::ClnRpc::new(&state.rpc_path)
@@ -434,6 +434,7 @@ async fn xrebalance_stats(
         "overrides": {
             "channel_updates": policies,
             "disabled_nodes": disabled_nodes,
+            "exclusions": exclusions,
         },
         "layer": layer,
     }))

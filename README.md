@@ -30,8 +30,10 @@ Design points:
   result, not an error.
 - **Strict fees.**  The budget is enforced at the askrene quote and
   again post-route; no per-part slippage.
-- **Feedback.**  Part outcomes are written back to a persistent
-  askrene layer, so retries route better than first attempts.
+- **Feedback.**  Part outcomes are written back -- liquidity facts
+  to a persistent askrene layer, policy facts (refreshes, node
+  disables, channel exclusions) to a shorter-lived in-memory store
+  -- so retries route better than first attempts.
 
 ## Interface (settling — subject to change)
 
@@ -110,8 +112,9 @@ Options (all dynamic -- adjustable at runtime via `lightning-cli
 setconfig`, so tuning never requires a plugin restart):
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
-    xrebalance-override-age=<seconds>     # expiry of learned policy and
-                                          # node-disable overrides (3600)
+    xrebalance-override-age=<seconds>     # expiry of learned overrides:
+                                          # policy refreshes, node disables,
+                                          # channel exclusions (3600)
     xrebalance-part-wait=<seconds>        # default snapshot window (180)
 
 ## Build and run
