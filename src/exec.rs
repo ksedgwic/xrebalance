@@ -75,6 +75,17 @@ const NODE_BIT: u64 = 0x2000;
 /// outlive its HTLC by this much).
 const CLAIM_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
+/// Escalation threshold for rotating InboundFee blame: once this
+/// many DISTINCT incoming channels have been blamed for the same
+/// outgoing direction within one override window, the outgoing
+/// direction is the common factor and is excluded itself.  One
+/// entrance charging an inbound fee blames one incoming; a node
+/// whose forwards never succeed rotates the blame across its
+/// entrances (prod1 measured 192 failures across 31 incomings at a
+/// single direction).  A wrong escalation costs one candidate hop
+/// for one override-age and self-heals.
+const INBOUND_BLAME_ESCALATION: usize = 2;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -239,6 +250,17 @@ async fn inform(
     amount_msat: u64,
     kind: &str,
 ) {
+    // An unconstrained inform is proof the direction forwarded for
+    // us -- innocence evidence for the blame escalation.  Recorded
+    // ahead of the coalescer: a suppressed duplicate write still
+    // proves the transit.
+    if kind == "unconstrained" {
+        state
+            .overrides
+            .lock()
+            .expect("overrides lock")
+            .record_transit(scidd, now_secs());
+    }
     let key = format!("{scidd}|{kind}");
     let is_lower_bound = kind != "constrained";
     let Some(bucket) = state
@@ -463,6 +485,31 @@ fn apply_fee_insufficient(
                 erring.scidd,
                 incoming.scidd,
             );
+            let now = now_secs();
+            let (blamed, transited) = {
+                let mut overrides =
+                    state.overrides.lock().expect("overrides lock");
+                (
+                    overrides.record_inbound_blame(
+                        &erring.scidd,
+                        &incoming.scidd,
+                        now,
+                    ),
+                    overrides.transited_recently(&erring.scidd, now),
+                )
+            };
+            if blamed >= INBOUND_BLAME_ESCALATION
+                && !transited
+                && !erring.ours
+            {
+                record_exclusion(state, &erring.scidd);
+                log::debug!(
+                    "fee_insufficient at {}: {blamed} distinct incoming \
+                     channels blamed within the override window and no \
+                     recent transit; excluding the common factor",
+                    erring.scidd,
+                );
+            }
         }
         FeeFault::StaleOutbound => {
             let cu = update.expect("StaleOutbound implies an update");
@@ -1058,6 +1105,93 @@ mod tests {
             htlc_maximum_msat: 1_000_000,
             inbound_fee: None,
         }
+    }
+
+    /// A 0x100c raw_message whose embedded channel_update
+    /// advertises zero fees: any allocation covers required = 0,
+    /// so classification lands InboundFee.
+    fn inbound_fee_failure_hex() -> String {
+        let mut cu = vec![0u8; 136];
+        // Plausible timestamp (0 would read as blanked).
+        cu[104..108].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+        cu[128..136].copy_from_slice(&u64::MAX.to_be_bytes());
+        let mut m = vec![0x10, 0x0c];
+        m.extend([0u8; 8]);
+        m.extend((cu.len() as u16).to_be_bytes());
+        m.extend(cu);
+        hex::encode(m)
+    }
+
+    // The first InboundFee verdict excludes only the incoming
+    // channel; a second verdict blaming a DIFFERENT incoming for
+    // the same outgoing direction escalates -- the outgoing is the
+    // common factor and is excluded too.
+    #[test]
+    fn rotating_inbound_blame_escalates_to_the_outgoing() {
+        let state = test_state();
+        let data = json!({"raw_message": inbound_fee_failure_hex()});
+        let p1 = part(vec![
+            hop("100x1x0/0", 1_020, true),
+            hop("200x1x0/1", 1_010, false),
+            hop("500x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p1, 2, &data);
+        assert_eq!(exclusions(&state), vec!["200x1x0/1"]);
+        let p2 = part(vec![
+            hop("100x1x0/0", 1_020, true),
+            hop("300x1x0/0", 1_010, false),
+            hop("500x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p2, 2, &data);
+        assert_eq!(
+            exclusions(&state),
+            vec!["200x1x0/1", "300x1x0/0", "500x1x0/0"]
+        );
+    }
+
+    // A direction that recently carried a part for us is innocent:
+    // rotating blame excludes the entrances but never the proven
+    // outgoing (the cyberdyne case -- unpayable entrances AND
+    // working ones on the same node).
+    #[test]
+    fn recent_transit_vetoes_escalation() {
+        let state = test_state();
+        state
+            .overrides
+            .lock()
+            .expect("overrides lock")
+            .record_transit("500x1x0/0", now_secs());
+        let data = json!({"raw_message": inbound_fee_failure_hex()});
+        for entrance in ["200x1x0/1", "300x1x0/0"] {
+            let p = part(vec![
+                hop("100x1x0/0", 1_020, true),
+                hop(entrance, 1_010, false),
+                hop("500x1x0/0", 1_000, false),
+                hop("400x1x0/1", 1_000, true),
+            ]);
+            apply_fee_insufficient(&state, &p, 2, &data);
+        }
+        // Both entrances excluded; the transited outgoing is not.
+        assert_eq!(exclusions(&state), vec!["200x1x0/1", "300x1x0/0"]);
+    }
+
+    // The same incoming blamed repeatedly is not a rotation: one
+    // entrance charging an inbound fee stays a one-channel fact.
+    #[test]
+    fn repeated_blame_from_one_incoming_does_not_escalate() {
+        let state = test_state();
+        let data = json!({"raw_message": inbound_fee_failure_hex()});
+        let p = part(vec![
+            hop("100x1x0/0", 1_020, true),
+            hop("200x1x0/1", 1_010, false),
+            hop("500x1x0/0", 1_000, false),
+            hop("400x1x0/1", 1_000, true),
+        ]);
+        apply_fee_insufficient(&state, &p, 2, &data);
+        apply_fee_insufficient(&state, &p, 2, &data);
+        assert_eq!(exclusions(&state), vec!["200x1x0/1"]);
     }
 
     // An unattributable FEE_INSUFFICIENT (no raw_message, hence no
