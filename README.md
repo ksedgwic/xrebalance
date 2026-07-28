@@ -1,4 +1,4 @@
-# xrebalance
+# xrebalance — the tenacious executor
 
 A Core Lightning plugin that moves funds between a node's own channels
 via independent circular self-payments, using
