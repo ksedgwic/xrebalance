@@ -62,10 +62,13 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
         'configs']['xrebalance-part-wait']['value_int'] == 60
 
     # EXECUTE: actually move the funds around the triangle.
+    # maxrounds=1 pins the single-shot response shape (parts at top
+    # level) that the assertions below read.
     before = only_one(
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
-                            amount_msat=100000, maxfee_msat=5000)
+                            amount_msat=100000, maxfee_msat=5000,
+                            maxrounds=1)
     assert res['status'] == 'executed', res
     part = only_one(res['parts'])
     assert part['status'] == 'complete', res
@@ -108,7 +111,7 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
                             amount_msat=50000, maxfee_msat=5000,
-                            part_wait=0, label='zero-wait')
+                            part_wait=0, maxrounds=1, label='zero-wait')
     assert res['status'] == 'executed', res
     assert only_one(res['parts'])['status'] == 'pending', res
     assert res['delivered_msat'] == 0, res
@@ -163,7 +166,7 @@ def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
 
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
                             amount_msat=200_000_000, maxfee_msat=1_000_000,
-                            label='starved')
+                            maxrounds=1, label='starved')
     assert res['status'] == 'executed', res
     part = only_one(res['parts'])
     assert part['status'] == 'failed', res
@@ -306,7 +309,8 @@ def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
         l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
     res = l1.rpc.xrebalance(sources=[f'{src}:60000'],
                             destinations=[scid_fill],
-                            amount_msat=100000, maxfee_msat=5000)
+                            amount_msat=100000, maxfee_msat=5000,
+                            maxrounds=1)
     assert res['status'] == 'executed', res
     assert res['effective_amount_msat'] == 55000, res
     assert res['delivered_msat'] == 55000, res
@@ -366,7 +370,7 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     replans the remainder, finds the sources and destination
     exhausted, and stops with a reason instead of an error.  The
     multi-round response carries per-round snapshots plus request
-    totals; maxrounds=1 (the default) keeps the old shape.
+    totals; maxrounds=1 keeps the old shape.
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,

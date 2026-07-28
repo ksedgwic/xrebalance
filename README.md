@@ -120,14 +120,15 @@ Options (all dynamic -- adjustable at runtime via `lightning-cli
 setconfig`, so tuning never requires a plugin restart):
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
+                                          # (10800)
     xrebalance-override-age=<seconds>     # expiry of learned overrides:
                                           # policy refreshes, node disables,
                                           # channel exclusions (3600)
-    xrebalance-part-wait=<seconds>        # default snapshot window (180)
+    xrebalance-part-wait=<seconds>        # default snapshot window (30)
     xrebalance-min-part-msat=<msat>       # fragment floor: least msat a
                                           # part may deliver (10000)
     xrebalance-max-rounds=<n>             # plan-execute rounds per request
-                                          # (1; maxrounds overrides;
+                                          # (50; maxrounds overrides;
                                           # ignored on dryrun)
 
 ## Build and run

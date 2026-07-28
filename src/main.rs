@@ -36,10 +36,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// to tune a knob would discard the very state being tuned -- the
 /// claim table (stranding in-flight parts), the learned overrides,
 /// and the coalescer cache.
+///
+/// Constraint knowledge should expire on the timescale of its
+/// re-acquisition cost, and tenacious rounds cut re-testing a
+/// corridor to one failed part.  Stale pessimism (a max bound on a
+/// corridor that has since refilled) silently prunes routes until
+/// it expires; stale optimism is rewritten by the first failure.
+/// So age toward re-learning: 3 hours keeps the layer dominated by
+/// continuously re-probed knowledge, and sits just above a periodic
+/// driver's cadence so each run inherits the run before.
 const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
     DefaultIntegerConfigOption {
         name: "xrebalance-constraint-age",
-        default: 6 * 60 * 60,
+        default: 3 * 60 * 60,
         description:
             "seconds until learned constraints in the xrebalance layer expire",
         deprecated: false,
@@ -67,10 +76,12 @@ const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption =
 /// directly in the response.  The response is only a snapshot -- the
 /// authoritative result channel is the xrebalance_part notification,
 /// emitted for EVERY part's terminal state, before or after the RPC
-/// returns (a background watcher follows stragglers).
+/// returns (a background watcher follows stragglers).  The wait
+/// recurs every round, so the default is short; stragglers detach
+/// with their amounts still counted as committed.
 const OPT_PART_WAIT: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     name: "xrebalance-part-wait",
-    default: 180,
+    default: 30,
     description: "default seconds the response waits for parts (per-request \
                   part_wait overrides; results always stream via the \
                   xrebalance_part notification)",
@@ -104,12 +115,13 @@ const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
 /// xpay ethos: keep trying until the amount moves or the request
 /// can prove it cannot.  A round that delivers nothing and learns
 /// nothing ends the loop early (the stall check), so the cap is a
-/// backstop for feedback bugs, not the usual exit.  Default 1:
-/// exactly the old single-shot behavior.
+/// backstop for feedback bugs, not the usual exit, and the default
+/// is sized for that backstop role.  maxrounds=1 requests the old
+/// single-shot behavior, response shape included.
 const OPT_MAX_ROUNDS: DefaultIntegerConfigOption =
     DefaultIntegerConfigOption {
         name: "xrebalance-max-rounds",
-        default: 1,
+        default: 50,
         description: "plan-execute rounds one request may run (per-request \
                       maxrounds overrides)",
         deprecated: false,
@@ -398,8 +410,8 @@ async fn xrebalance(
 
     // The tenacious loop: replan the still-unmoved remainder each
     // round, against everything the earlier rounds' failures taught.
-    // With maxrounds 1 (the default) this is exactly the old
-    // single-shot request, response shape included.
+    // With maxrounds 1 this is exactly the old single-shot
+    // request, response shape included.
     let rounds_max = parsed
         .maxrounds
         .map(u64::from)
