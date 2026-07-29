@@ -130,6 +130,10 @@ setconfig`, so tuning never requires a plugin restart):
     xrebalance-max-rounds=<n>             # plan-execute rounds per request
                                           # (50; maxrounds overrides;
                                           # ignored on dryrun)
+    xrebalance-final-cltv=<blocks>        # final-hop cltv delta for return
+                                          # legs (40): slack for the removal
+                                          # handshake before lightningd's
+                                          # fulfilled-HTLC close deadline
 
 ## Build and run
 

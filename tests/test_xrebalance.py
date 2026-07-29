@@ -45,6 +45,10 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
     fill_dir = 0 if l3.info['id'] < l1.info['id'] else 1
     assert path[-1]['short_channel_id_dir'] == f"{scid_fill}/{fill_dir}", res
     assert path[-1]['node_id_out'] == l1.info['id'], res
+    # The return leg lands with the configured final-hop cltv slack
+    # (xrebalance-final-cltv), giving the removal handshake room
+    # before lightningd's fulfilled-HTLC close deadline.
+    assert path[-1]['cltv_out'] == 40, res
 
     # Zero-delivered-is-a-result: an impossible budget plans nothing
     # but does not error.
@@ -60,6 +64,12 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
     l1.rpc.setconfig('xrebalance-part-wait', 60)
     assert l1.rpc.listconfigs('xrebalance-part-wait')[
         'configs']['xrebalance-part-wait']['value_int'] == 60
+    l1.rpc.setconfig('xrebalance-final-cltv', 60)
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert only_one(res['routes'])['path'][-1]['cltv_out'] == 60, res
+    assert l1.rpc.call('xrebalance-stats')['options']['final_cltv'] == 60
 
     # EXECUTE: actually move the funds around the triangle.
     # maxrounds=1 pins the single-shot response shape (parts at top

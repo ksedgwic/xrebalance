@@ -610,7 +610,7 @@ async fn plan_in_layer(
             // Split layer LAST: its masks must override auto.localchans.
             "layers": ["auto.localchans", PERSISTENT_LAYER, split],
             "maxfee_msat": rung_maxfee,
-            "final_cltv": 14,
+            "final_cltv": state.final_cltv.load(Ordering::Relaxed),
         });
         if let Some(maxparts) = params.maxparts {
             getroutes["maxparts"] = json!(maxparts);

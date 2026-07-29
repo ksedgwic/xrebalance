@@ -996,6 +996,7 @@ mod tests {
             part_wait_secs: Arc::new(AtomicU64::new(0)),
             min_part_msat: Arc::new(AtomicU64::new(0)),
             max_rounds: Arc::new(AtomicU64::new(1)),
+            final_cltv: Arc::new(AtomicU64::new(40)),
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
             feedback_writes: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),

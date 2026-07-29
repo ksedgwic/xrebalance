@@ -129,6 +129,27 @@ const OPT_MAX_ROUNDS: DefaultIntegerConfigOption =
         multi: false,
     };
 
+/// Final-hop CLTV delta granted to each part's return leg.  The
+/// htlc_accepted hook claims the HTLC the moment it arrives, but the
+/// removal handshake still needs the peer to respond, and lightningd
+/// force-closes a channel whose fulfilled incoming HTLC is still
+/// present within ~cltv-delta/2 blocks of expiry (17 at the default
+/// cltv-delta of 34).  This delta minus that buffer is how many
+/// blocks a slow or flapping peer has to finish the removal before
+/// the deadline check fires; a value at or below the buffer makes
+/// every return leg a force-close race against the next block.
+const OPT_FINAL_CLTV: DefaultIntegerConfigOption =
+    DefaultIntegerConfigOption {
+        name: "xrebalance-final-cltv",
+        default: 40,
+        description: "final-hop cltv delta for return legs (slack for \
+                      the removal handshake before lightningd's \
+                      fulfilled-HTLC close deadline)",
+        deprecated: false,
+        dynamic: true,
+        multi: false,
+    };
+
 /// Notification topic: one event per part reaching a terminal state,
 /// carrying the part's own payment_hash (parts are independent
 /// payments, not an MPP set), part_index, first-hop scid, real
@@ -164,6 +185,9 @@ pub struct State {
     /// Round cap for the tenacious loop (dynamic; read per
     /// request).
     pub max_rounds: Arc<AtomicU64>,
+    /// Final-hop cltv delta for return legs (dynamic; read per
+    /// request).
+    pub final_cltv: Arc<AtomicU64>,
     /// One request at a time: concurrent requests would race each
     /// other for the same liquidity and re-learn the same failures,
     /// so non-dryrun requests queue here.
@@ -264,6 +288,7 @@ async fn run() -> Result<(), Error> {
         .option(OPT_PART_WAIT)
         .option(OPT_MIN_PART)
         .option(OPT_MAX_ROUNDS)
+        .option(OPT_FINAL_CLTV)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
         .rpcmethod(
             "xrebalance",
@@ -297,12 +322,17 @@ async fn run() -> Result<(), Error> {
         .ok()
         .filter(|&r| r >= 1)
         .ok_or_else(|| anyhow!("xrebalance-max-rounds must be at least 1"))?;
+    let final_cltv = u64::try_from(configured.option(&OPT_FINAL_CLTV)?)
+        .ok()
+        .filter(|&c| c >= 1)
+        .ok_or_else(|| anyhow!("xrebalance-final-cltv must be at least 1"))?;
     let state = State {
         rpc_path: PathBuf::from(configured.configuration().rpc_file.as_str()),
         constraint_age: Arc::new(AtomicU64::new(constraint_age)),
         part_wait_secs: Arc::new(AtomicU64::new(part_wait)),
         min_part_msat: Arc::new(AtomicU64::new(min_part)),
         max_rounds: Arc::new(AtomicU64::new(max_rounds)),
+        final_cltv: Arc::new(AtomicU64::new(final_cltv)),
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
@@ -317,13 +347,14 @@ async fn run() -> Result<(), Error> {
     let plugin = configured.start(state).await?;
     log::info!(
         "xrebalance v{} started: constraint-age {}s, override-age {}s, \
-         part-wait {}s, min-part {}msat, max-rounds {}",
+         part-wait {}s, min-part {}msat, max-rounds {}, final-cltv {}",
         env!("CARGO_PKG_VERSION"),
         eng(constraint_age),
         eng(override_age),
         eng(part_wait),
         eng(min_part),
         eng(max_rounds),
+        final_cltv,
     );
     plugin.join().await
 }
@@ -657,6 +688,7 @@ async fn xrebalance_stats(
             "part_wait": state.part_wait_secs.load(Ordering::Relaxed),
             "min_part_msat": state.min_part_msat.load(Ordering::Relaxed),
             "max_rounds": state.max_rounds.load(Ordering::Relaxed),
+            "final_cltv": state.final_cltv.load(Ordering::Relaxed),
         },
         "claims": claims,
         "coalescer_entries": coalescer,
@@ -717,6 +749,12 @@ async fn setconfig(
                 return Err(anyhow!("{name} must be at least 1"));
             }
             state.max_rounds.store(value, Ordering::Relaxed);
+        }
+        "xrebalance-final-cltv" => {
+            if value < 1 {
+                return Err(anyhow!("{name} must be at least 1"));
+            }
+            state.final_cltv.store(value, Ordering::Relaxed);
         }
         _ => return Err(anyhow!("unknown dynamic option {name}")),
     }
