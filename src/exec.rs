@@ -597,19 +597,23 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             eng(ppm),
         );
     } else {
+        // Column widths: scidds run to 17 chars, the longest common
+        // failcode name (TEMPORARY_CHANNEL_FAILURE) to 25, and part
+        // amounts to 11 grouped digits -- padded so a screen of
+        // part lines reads as a table.
         let geometry = match (part.hops_short, &part.erring_scidd) {
-            (Some(n), Some(s)) => format!(" {n} hops short at {s}"),
+            (Some(n), Some(s)) => format!(" {n:>2} hops short at {s:<17}"),
             _ => String::new(),
         };
         let code = match part.failcode {
-            Some(c) => format!(": {} ({c:#x})", failcode_name(c)),
+            Some(c) => format!(": {:<25} ({c:#x})", failcode_name(c)),
             None => String::new(),
         };
         let planned_fee =
             part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
             "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
-             {} msat ({:>6} ppm)",
+             {:>11} msat ({:>6} ppm)",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
