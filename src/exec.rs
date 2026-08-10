@@ -588,8 +588,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             0
         };
         log::debug!(
-            "req {req}: part {:>2}/{:>2} complete: delivered {:>10} msat \
-             fee {:>7} msat ({:>6} ppm)",
+            "req {req}: part {:>2}/{:>2} complete: delivered {:>13} msat \
+             fee {:>9} msat ({:>6} ppm)",
             part.part_index,
             part.parts_total,
             eng(part.delivered_msat()),
@@ -599,8 +599,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
     } else {
         // Column widths: scidds run to 17 chars, the longest common
         // failcode name (TEMPORARY_CHANNEL_FAILURE) to 25, and part
-        // amounts to 11 grouped digits -- padded so a screen of
-        // part lines reads as a table.
+        // amounts to 13 grouped digits (a 1.1 BTC part) -- padded so
+        // a screen of part lines reads as a table.
         let geometry = match (part.hops_short, &part.erring_scidd) {
             (Some(n), Some(s)) => format!(" {n:>2} hops short at {s:<17}"),
             _ => String::new(),
@@ -613,7 +613,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
             "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
-             {:>11} msat ({:>6} ppm)",
+             {:>13} msat ({:>6} ppm)",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
