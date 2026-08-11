@@ -1,6 +1,6 @@
 [package]
 name = "xrebalance"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 license = "MIT"
 description = "Core Lightning plugin: the tenacious circular self-rebalance executor, built on askrene"
