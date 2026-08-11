@@ -404,3 +404,40 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     assert res['stop_reason'], res
     l1.daemon.wait_for_log(r"req tenacious: round 1/5: delivered")
     l1.daemon.wait_for_log(r"req tenacious: finished after \d+ round")
+
+
+def test_limits_across_rounds(node_factory, bitcoind, xrebalance_plugin,
+                              part_subscriber):
+    """A per-target limit is one pot across the rounds: an ask far
+    beyond a source's cap stops once the cap is exhausted, instead
+    of drawing up to the cap afresh every round.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    # The corridor carries ~1G msat, so the cap (600M) binds before
+    # liquidity does, and the ask (2G) leaves plenty of remainder to
+    # tempt later rounds into drawing on the source again.
+    cap = 600_000_000
+    res = l1.rpc.xrebalance(sources=[{'scid': src, 'max_msat': cap}],
+                            destinations=[scid_fill],
+                            amount_msat=2_000_000_000,
+                            maxfee_msat=100_000,
+                            maxrounds=5, label='capped')
+    assert res['status'] == 'executed', res
+    # The cap-exhausted stop takes at least one extra round to see.
+    assert 2 <= res['rounds_run'] <= 5, res
+    # Something substantial moved...
+    assert res['delivered_msat'] >= 400_000_000, res
+    # ...but what crossed the source over ALL rounds (delivered plus
+    # fees) stays within the cap, to routing granularity (askrene's
+    # MCF quantizes in ~amount/1000 units per round).
+    slop = 2_000_000_000 // 1000
+    assert res['delivered_msat'] + res['fee_msat'] <= cap + slop, res

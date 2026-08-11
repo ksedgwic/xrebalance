@@ -24,7 +24,9 @@ Design points:
 - **Per-channel caps.**  Any source or destination can carry a limit
   on how much this request moves through it, asserted as an askrene
   constraint so the solver plans around it rather than xrebalance
-  post-filtering routes.
+  post-filtering routes.  A cap bounds the whole request: later
+  rounds see it drawn down by what earlier rounds already committed
+  through the channel.
 - **Partial success is the semantic.**  `amount_msat` is a ceiling;
   every settled part is banked liquidity; zero delivered is a
   result, not an error.

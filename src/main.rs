@@ -359,6 +359,18 @@ async fn run() -> Result<(), Error> {
     plugin.join().await
 }
 
+/// Draw each capped spec down by the flow earlier rounds committed
+/// through its channel: a per-target limit is one pot across the
+/// rounds, like an absolute fee budget.  Uncapped specs stay
+/// uncapped.
+fn draw_down(specs: &mut [spec::ChanSpec], committed: &HashMap<String, u64>) {
+    for s in specs {
+        if let (Some(cap), Some(used)) = (s.max_msat, committed.get(&s.scid)) {
+            s.max_msat = Some(cap.saturating_sub(*used));
+        }
+    }
+}
+
 async fn xrebalance(
     _plugin: Plugin<State>,
     params: serde_json::Value,
@@ -457,6 +469,12 @@ async fn xrebalance(
     let mut fee_total: u64 = 0;
     let mut pending_total: u64 = 0;
     let mut pending_fee_total: u64 = 0;
+    // Committed flow by target channel so far -- sent (sources,
+    // fees included) and delivered (destinations) -- drawn down
+    // from the per-target limits each round, so a limit bounds the
+    // whole request, not each round.
+    let mut source_committed: HashMap<String, u64> = HashMap::new();
+    let mut dest_committed: HashMap<String, u64> = HashMap::new();
     let mut round: u64 = 0;
     let stop_reason: String;
     loop {
@@ -489,6 +507,9 @@ async fn xrebalance(
                 pot.saturating_sub(fee_total.saturating_add(pending_fee_total)),
             );
         }
+        // Per-target limits are one pot across the rounds too.
+        draw_down(&mut round_params.sources, &source_committed);
+        draw_down(&mut round_params.destinations, &dest_committed);
         let fb_before = state.feedback_writes.load(Ordering::Relaxed);
         let planned = match plan::plan(state, &round_params).await {
             Ok(p) => p,
@@ -526,6 +547,12 @@ async fn xrebalance(
         fee_total += outcome.fee_msat;
         pending_total += outcome.pending_msat;
         pending_fee_total += outcome.pending_fee_msat;
+        for (scid, msat) in &outcome.source_committed_msat {
+            *source_committed.entry(scid.clone()).or_default() += *msat;
+        }
+        for (scid, msat) in &outcome.dest_committed_msat {
+            *dest_committed.entry(scid.clone()).or_default() += *msat;
+        }
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
@@ -791,7 +818,35 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
-    use super::eng;
+    use super::{draw_down, eng, spec::ChanSpec};
+    use std::collections::HashMap;
+
+    #[test]
+    fn draw_down_shrinks_only_capped_specs() {
+        let spec = |scid: &str, max_msat| ChanSpec {
+            scid: scid.to_owned(),
+            max_msat,
+        };
+        let mut specs = vec![
+            spec("100x1x0", Some(1_000)),
+            spec("200x1x0", None),
+            spec("300x1x0", Some(500)),
+            spec("400x1x0", Some(700)),
+        ];
+        let committed = HashMap::from([
+            ("100x1x0".to_owned(), 400),
+            ("200x1x0".to_owned(), 123),
+            ("300x1x0".to_owned(), 800),
+        ]);
+        draw_down(&mut specs, &committed);
+        assert_eq!(specs[0].max_msat, Some(600));
+        // Uncapped stays uncapped, whatever flowed through it.
+        assert_eq!(specs[1].max_msat, None);
+        // Overshoot (routing granularity) saturates to exhausted.
+        assert_eq!(specs[2].max_msat, Some(0));
+        // Untouched targets keep their full cap.
+        assert_eq!(specs[3].max_msat, Some(700));
+    }
 
     #[test]
     fn eng_groups_digits() {

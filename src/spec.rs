@@ -2,10 +2,14 @@
 //!
 //! Each element names one of our channels and may cap how much this
 //! request moves through it -- at most `max_msat` drawn from a
-//! source, at most `max_msat` delivered into a destination.  The
-//! effective bound is always the smaller of the cap and the
-//! channel's live liquidity (plan.rs asserts the cap as an askrene
-//! constraint; constraint intersection does the min).
+//! source (fees included: the cap bounds what crosses the channel),
+//! at most `max_msat` delivered into a destination.  A cap bounds
+//! the whole request: the round loop (main.rs) draws it down by
+//! what earlier rounds committed through the channel, so partial
+//! deliveries never add up past it.  Within a round the effective
+//! bound is the smaller of the remaining cap and the channel's live
+//! liquidity (plan.rs asserts the cap as an askrene constraint;
+//! constraint intersection does the min).
 //!
 //! Two spellings parse to the same thing:
 //!

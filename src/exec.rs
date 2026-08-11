@@ -28,6 +28,7 @@ use cln_plugin::Plugin;
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -700,12 +701,44 @@ pub struct ExecOutcome {
     /// Planned fees of those in-flight parts, reserved against an
     /// absolute (msat) budget.
     pub pending_fee_msat: u64,
+    /// Committed flow by target channel: what crossed each source
+    /// (sent, fees included) and landed in each destination
+    /// (delivered).  The loop draws these down from the per-target
+    /// limits, so a limit is one pot across the rounds, like an
+    /// absolute fee budget.
+    pub source_committed_msat: HashMap<String, u64>,
+    pub dest_committed_msat: HashMap<String, u64>,
+}
+
+/// The channel half of a "scid/dir" string.
+fn scid_of(scidd: &str) -> String {
+    scidd.split_once('/').map_or(scidd, |(s, _)| s).to_owned()
+}
+
+/// Sum committed flow by target channel over the complete and
+/// pending parts.  A pending part may yet settle, so its planned
+/// amounts are spoken for; if it later fails, the request
+/// under-delivers through that target rather than overshooting its
+/// limit.
+fn committed_by_target(
+    parts: &[Part],
+) -> (HashMap<String, u64>, HashMap<String, u64>) {
+    let mut by_source: HashMap<String, u64> = HashMap::new();
+    let mut by_dest: HashMap<String, u64> = HashMap::new();
+    for p in parts.iter().filter(|p| p.status != "failed") {
+        *by_source.entry(scid_of(&p.first_hop)).or_default() +=
+            p.planned_sent_msat;
+        *by_dest.entry(scid_of(&p.return_hop)).or_default() += p.planned_msat;
+    }
+    (by_source, by_dest)
 }
 
 /// Bundle the terminal render with the cross-round totals.
 fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> ExecOutcome {
     let pending: Vec<&Part> =
         parts.iter().filter(|p| p.status == "pending").collect();
+    let (source_committed_msat, dest_committed_msat) =
+        committed_by_target(parts);
     ExecOutcome {
         delivered_msat: parts.iter().map(Part::delivered_msat).sum(),
         fee_msat: parts.iter().map(Part::fee_msat).sum(),
@@ -714,6 +747,8 @@ fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Exec
             .iter()
             .map(|p| p.planned_sent_msat.saturating_sub(p.planned_msat))
             .sum(),
+        source_committed_msat,
+        dest_committed_msat,
         response: render(params, plan, parts),
     }
 }
@@ -1039,6 +1074,29 @@ mod tests {
             failcode: Some(WIRE_FEE_INSUFFICIENT),
             erring_scidd: None,
         }
+    }
+
+    #[test]
+    fn committed_by_target_counts_complete_and_pending() {
+        let mut settled = part(vec![
+            hop("100x1x0/0", 1_010, true),
+            hop("200x1x0/1", 1_005, false),
+            hop("300x1x0/0", 1_000, true),
+        ]);
+        settled.status = "complete";
+        settled.planned_msat = 1_000;
+        settled.planned_sent_msat = 1_010;
+        let mut in_flight = settled.clone();
+        in_flight.status = "pending";
+        let mut failed = settled.clone();
+        failed.status = "failed";
+        let (by_source, by_dest) =
+            committed_by_target(&[settled, in_flight, failed]);
+        // Keyed by scid (limits name channels, not directions);
+        // sources count sent, destinations delivered; the failed
+        // part contributes nothing.
+        assert_eq!(by_source, HashMap::from([("100x1x0".into(), 2_020)]));
+        assert_eq!(by_dest, HashMap::from([("300x1x0".into(), 2_000)]));
     }
 
     /// The override store's current exclusions, sorted.
