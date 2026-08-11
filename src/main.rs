@@ -165,6 +165,10 @@ pub const TOPIC_PART: &str = "xrebalance_part";
 pub struct Claim {
     pub preimage: String,
     pub payment_secret: String,
+    /// Msat the part's final hop delivers (the route's last
+    /// amount_out); an HTLC offering less does not settle.  See
+    /// try_claim.
+    pub amount_msat: u64,
     pub created: u64,
 }
 
@@ -789,36 +793,95 @@ async fn setconfig(
     Ok(json!({}))
 }
 
-/// Claim arriving parts of our own self-payments: resolve with the
-/// registered preimage when hash AND secret match, otherwise pass
-/// the HTLC down the hook chain untouched.  A matching entry is
-/// consumed -- each part is an independent payment, so its claim
-/// has exactly one job, and removing it closes the replay surface
-/// once the preimage becomes public along the settled path.
+/// Outcome of matching one arriving HTLC against the claim table.
+enum ClaimVerdict {
+    /// Ours and whole: the entry was consumed -- each part is an
+    /// independent payment, so its claim has exactly one job, and
+    /// removing it closes the replay surface once the preimage
+    /// becomes public along the settled path.
+    Resolve { preimage: String },
+    /// Ours, but the HTLC offers less than the part delivers.  The
+    /// entry is kept (a whole retry can still settle); the HTLC is
+    /// left to lightningd, which fails it -- no invoice exists for
+    /// the hash.
+    Underpaid { expected_msat: u64, incoming_msat: u64 },
+    /// Not ours: pass it down the hook chain untouched.
+    Pass,
+}
+
+/// Match an arriving HTLC against the claim table: hash AND secret
+/// AND amount.  Resolving from the hook bypasses lightningd's own
+/// final-hop amount check (final_incorrect_htlc_amount), and the
+/// last-hop peer relays our onion intact -- secret included -- while
+/// choosing the HTLC amount itself.  Settling on hash and secret
+/// alone would let that peer offer less than the part delivers,
+/// learn the preimage anyway, and claim the full amount from its
+/// upstream, keeping the difference.  Overpayment settles: the
+/// sender loses nothing by it.
+fn try_claim(
+    claims: &mut HashMap<String, Claim>,
+    v: &serde_json::Value,
+) -> ClaimVerdict {
+    let Some(hash) = v["htlc"]["payment_hash"].as_str() else {
+        return ClaimVerdict::Pass;
+    };
+    let Some(claim) = claims.get(hash) else {
+        return ClaimVerdict::Pass;
+    };
+    if v["onion"]["payment_secret"].as_str()
+        != Some(claim.payment_secret.as_str())
+    {
+        return ClaimVerdict::Pass;
+    }
+    // A missing or malformed amount reads as zero: never whole.
+    let incoming_msat = v["htlc"]["amount_msat"].as_u64().unwrap_or(0);
+    if incoming_msat < claim.amount_msat {
+        return ClaimVerdict::Underpaid {
+            expected_msat: claim.amount_msat,
+            incoming_msat,
+        };
+    }
+    let claim = claims.remove(hash).expect("present above");
+    ClaimVerdict::Resolve {
+        preimage: claim.preimage,
+    }
+}
+
+/// Claim arriving parts of our own self-payments with the registered
+/// preimage; the decision is try_claim's.
 async fn htlc_accepted(
     plugin: Plugin<State>,
     v: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    if let Some(hash) = v["htlc"]["payment_hash"].as_str() {
+    let verdict = {
         let mut claims = plugin.state().claims.lock().expect("claims lock");
-        let secret_matches = claims.get(hash).is_some_and(|claim| {
-            v["onion"]["payment_secret"].as_str()
-                == Some(claim.payment_secret.as_str())
-        });
-        if secret_matches {
-            let claim = claims.remove(hash).expect("checked above");
-            return Ok(json!({
-                "result": "resolve",
-                "payment_key": claim.preimage,
-            }));
+        try_claim(&mut claims, &v)
+    };
+    match verdict {
+        ClaimVerdict::Resolve { preimage } => Ok(json!({
+            "result": "resolve",
+            "payment_key": preimage,
+        })),
+        ClaimVerdict::Underpaid {
+            expected_msat,
+            incoming_msat,
+        } => {
+            log::warn!(
+                "not resolving {}: htlc offers {} msat, part delivers {}",
+                v["htlc"]["payment_hash"].as_str().unwrap_or("?"),
+                eng(incoming_msat),
+                eng(expected_msat),
+            );
+            Ok(json!({"result": "continue"}))
         }
+        ClaimVerdict::Pass => Ok(json!({"result": "continue"})),
     }
-    Ok(json!({"result": "continue"}))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_down, eng, spec::ChanSpec};
+    use super::{draw_down, eng, spec::ChanSpec, try_claim, Claim, ClaimVerdict};
+    use serde_json::json;
     use std::collections::HashMap;
 
     #[test]
@@ -855,5 +918,108 @@ mod tests {
         assert_eq!(eng(1000), "1_000");
         assert_eq!(eng(10005958), "10_005_958");
         assert_eq!(eng(u64::MAX), "18_446_744_073_709_551_615");
+    }
+
+    fn hash() -> String {
+        "aa".repeat(32)
+    }
+
+    fn secret() -> String {
+        "22".repeat(32)
+    }
+
+    fn one_claim(amount_msat: u64) -> HashMap<String, Claim> {
+        let mut claims = HashMap::new();
+        claims.insert(
+            hash(),
+            Claim {
+                preimage: "11".repeat(32),
+                payment_secret: secret(),
+                amount_msat,
+                created: 0,
+            },
+        );
+        claims
+    }
+
+    fn htlc(hash: &str, secret: &str, amount_msat: u64) -> serde_json::Value {
+        json!({
+            "htlc": {"payment_hash": hash, "amount_msat": amount_msat},
+            "onion": {"payment_secret": secret},
+        })
+    }
+
+    #[test]
+    fn whole_htlc_resolves_and_consumes_the_claim() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&hash(), &secret(), 1000);
+        match try_claim(&mut claims, &v) {
+            ClaimVerdict::Resolve { preimage } => {
+                assert_eq!(preimage, "11".repeat(32))
+            }
+            _ => panic!("expected resolve"),
+        }
+        assert!(claims.is_empty());
+        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+    }
+
+    #[test]
+    fn overpaying_htlc_resolves() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&hash(), &secret(), 1001);
+        assert!(matches!(
+            try_claim(&mut claims, &v),
+            ClaimVerdict::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn short_htlc_is_refused_and_the_claim_kept() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&hash(), &secret(), 999);
+        assert!(matches!(
+            try_claim(&mut claims, &v),
+            ClaimVerdict::Underpaid {
+                expected_msat: 1000,
+                incoming_msat: 999,
+            }
+        ));
+        let v = htlc(&hash(), &secret(), 1000);
+        assert!(matches!(
+            try_claim(&mut claims, &v),
+            ClaimVerdict::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_amount_reads_as_zero() {
+        let mut claims = one_claim(1000);
+        let v = json!({
+            "htlc": {"payment_hash": hash()},
+            "onion": {"payment_secret": secret()},
+        });
+        assert!(matches!(
+            try_claim(&mut claims, &v),
+            ClaimVerdict::Underpaid {
+                incoming_msat: 0,
+                ..
+            }
+        ));
+        assert_eq!(claims.len(), 1);
+    }
+
+    #[test]
+    fn wrong_secret_passes_and_the_claim_kept() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&hash(), &"33".repeat(32), 1000);
+        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+        assert_eq!(claims.len(), 1);
+    }
+
+    #[test]
+    fn unknown_hash_passes() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&"bb".repeat(32), &secret(), 1000);
+        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
     }
 }

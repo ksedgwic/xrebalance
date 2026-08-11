@@ -104,6 +104,10 @@ set**: each carries its own preimage, payment_hash, and secret.
 (Sharing one hash would let a node on a settled part's path steal a
 still-in-flight part routed through it; per-part preimages close
 that window, and intermediates cannot even correlate the parts.)
+A part settles only when the arriving HTLC offers its full
+delivered amount: the last-hop peer chooses the HTLC amount, and
+settling a short one would hand that peer the preimage to claim
+the full amount from its upstream.
 
 One `xrebalance_part` notification is broadcast per part reaching a
 terminal state, carrying the part's own payment_hash, its

@@ -792,9 +792,12 @@ pub async fn execute(
             .collect::<Result<Vec<_>, _>>()?;
         let first = &path[0];
         let last = &path[path.len() - 1];
+        let planned_msat = last["amount_out_msat"].as_u64().unwrap_or(0);
 
         // This part's own claim: fresh preimage and secret, so no
-        // other part's settlement can be replayed against it.
+        // other part's settlement can be replayed against it, and
+        // the delivered amount an arriving HTLC must offer in full
+        // to settle (try_claim).
         let preimage: [u8; 32] = rand::random();
         let payment_secret: [u8; 32] = rand::random();
         let payment_hash = hex::encode(Sha256::digest(preimage));
@@ -803,6 +806,7 @@ pub async fn execute(
             Claim {
                 preimage: hex::encode(preimage),
                 payment_secret: hex::encode(payment_secret),
+                amount_msat: planned_msat,
                 created: now_secs(),
             },
         );
@@ -840,7 +844,7 @@ pub async fn execute(
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            planned_msat: last["amount_out_msat"].as_u64().unwrap_or(0),
+            planned_msat,
             planned_sent_msat: first["amount_in_msat"].as_u64().unwrap_or(0),
             hops,
             status: "pending",
