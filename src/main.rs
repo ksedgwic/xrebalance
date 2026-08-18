@@ -578,6 +578,7 @@ async fn xrebalance(
         return Ok(rounds.pop().expect("round 1 always executes"));
     }
     log::debug!("req {req}: finished after {round} round(s): {stop_reason}");
+    let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
     Ok(serde_json::json!({
         "status": "executed",
         "label": parsed.label,
@@ -589,7 +590,63 @@ async fn xrebalance(
         "fee_ppm": plan::fee_ppm(fee_total, delivered_total),
         "pending_msat": pending_total,
         "rounds": rounds,
+        "summary": summary,
     }))
+}
+
+/// Digest a multi-round request into the few numbers a caller scans
+/// for first.  The field is named "summary" because the response
+/// object's keys serialize in sorted order, which lands it after
+/// the bulky "rounds" array: the summary is what remains on screen
+/// when the details scroll by.
+fn summarize_rounds(
+    rounds: &[serde_json::Value],
+    delivered_msat: u64,
+    fee_msat: u64,
+    pending_msat: u64,
+) -> serde_json::Value {
+    let parts: Vec<&serde_json::Value> = rounds
+        .iter()
+        .filter_map(|r| r["parts"].as_array())
+        .flatten()
+        .collect();
+    let count = |s: &str| parts.iter().filter(|p| p["status"] == s).count();
+    let complete = count("complete");
+    let pending = count("pending");
+    let mut summary = json!({
+        "rounds": rounds.len(),
+        "parts": parts.len(),
+        "parts_complete": complete,
+        "parts_failed": count("failed"),
+        "parts_pending": pending,
+        "delivered_msat": delivered_msat,
+        "fee_msat": fee_msat,
+        "fee_ppm": plan::fee_ppm(fee_msat, delivered_msat),
+        "pending_msat": pending_msat,
+    });
+    if complete == 0 && pending == 0 {
+        // Nothing moved and nothing is in flight: report the part
+        // that came nearest to landing, so the wall is visible
+        // without reading the rounds.  Nearest = fewest hops left
+        // uncrossed; ties go to the largest amount.
+        let closest = parts
+            .iter()
+            .filter(|p| p["status"] == "failed")
+            .filter_map(|p| p["hops_short"].as_u64().map(|h| (h, p)))
+            .min_by_key(|(h, p)| (*h, u64::MAX - p["planned_msat"].as_u64().unwrap_or(0)));
+        if let Some((hops_short, part)) = closest {
+            summary["closest_miss"] = json!({
+                "hops_short": hops_short,
+                "planned_msat": part["planned_msat"],
+                "erring_scidd": part["erring_scidd"],
+                "failcode": part["failcode"],
+                "failcode_name": part["failcode"]
+                    .as_u64()
+                    .map(onion_error::failcode_name),
+            });
+        }
+    }
+    summary
 }
 
 /// Report the plugin's state in one place: what the persistent
@@ -852,7 +909,7 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_down, eng, spec::ChanSpec, try_claim, Claim, ClaimVerdict};
+    use super::{draw_down, eng, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -881,6 +938,63 @@ mod tests {
         assert_eq!(specs[2].max_msat, Some(0));
         // Untouched targets keep their full cap.
         assert_eq!(specs[3].max_msat, Some(700));
+    }
+
+    #[test]
+    fn summarize_counts_across_rounds() {
+        let rounds = vec![
+            json!({"parts": [
+                {"status": "failed", "planned_msat": 100, "hops_short": 2},
+                {"status": "complete", "planned_msat": 200},
+            ]}),
+            json!({"parts": [
+                {"status": "pending", "planned_msat": 300},
+            ]}),
+            // A no-route round carries an empty parts array.
+            json!({"parts": []}),
+        ];
+        let s = summarize_rounds(&rounds, 200, 3, 300);
+        assert_eq!(s["rounds"], 3);
+        assert_eq!(s["parts"], 3);
+        assert_eq!(s["parts_complete"], 1);
+        assert_eq!(s["parts_failed"], 1);
+        assert_eq!(s["parts_pending"], 1);
+        assert_eq!(s["delivered_msat"], 200);
+        assert_eq!(s["fee_msat"], 3);
+        assert_eq!(s["pending_msat"], 300);
+        // Something landed: no miss to report.
+        assert!(s.get("closest_miss").is_none());
+    }
+
+    #[test]
+    fn summarize_closest_miss_fewest_hops_then_largest() {
+        let rounds = vec![json!({"parts": [
+            {"status": "failed", "planned_msat": 500_000, "hops_short": 3,
+             "erring_scidd": "1x1x1/0", "failcode": 4103},
+            {"status": "failed", "planned_msat": 100_000, "hops_short": 2,
+             "erring_scidd": "2x2x2/1", "failcode": 4103},
+            {"status": "failed", "planned_msat": 250_000, "hops_short": 2,
+             "erring_scidd": "3x3x3/0", "failcode": 16394},
+            // No failure geometry recorded: never the closest miss.
+            {"status": "failed", "planned_msat": 900_000},
+        ]})];
+        let s = summarize_rounds(&rounds, 0, 0, 0);
+        let miss = &s["closest_miss"];
+        assert_eq!(miss["hops_short"], 2);
+        assert_eq!(miss["planned_msat"], 250_000);
+        assert_eq!(miss["erring_scidd"], "3x3x3/0");
+        assert_eq!(miss["failcode"], 16394); // 0x400a
+        assert_eq!(miss["failcode_name"], "UNKNOWN_NEXT_PEER");
+    }
+
+    #[test]
+    fn summarize_no_miss_while_parts_pend() {
+        let rounds = vec![json!({"parts": [
+            {"status": "failed", "planned_msat": 100, "hops_short": 1},
+            {"status": "pending", "planned_msat": 200},
+        ]})];
+        let s = summarize_rounds(&rounds, 0, 0, 200);
+        assert!(s.get("closest_miss").is_none());
     }
 
     #[test]
