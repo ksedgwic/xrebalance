@@ -38,8 +38,7 @@ use crate::{State, XRebalanceParams};
 /// The stand-in destination node id.  Not a valid curve point; must
 /// merely be distinct from every real node id (byte 1 == 0x00 makes
 /// a gossip collision effectively impossible).
-const FAKE_US_IN: &str =
-    "0200000000000000000000000000000000000000000000000000000000000000ff";
+const FAKE_US_IN: &str = "0200000000000000000000000000000000000000000000000000000000000000ff";
 
 /// Mirror scids are allocated in this block: far above the real
 /// chain tip for decades, so they cannot collide with gossip.
@@ -212,10 +211,10 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     // net of fees.
     let src_movable = match (params.maxfee_msat, params.maxfee_ppm) {
         (Some(msat), None) => src_bound.saturating_sub(msat),
-        (None, Some(ppm)) => u64::try_from(
-            u128::from(src_bound) * 1_000_000 / (1_000_000 + u128::from(ppm)),
-        )
-        .expect("shrunk from a u64"),
+        (None, Some(ppm)) => {
+            u64::try_from(u128::from(src_bound) * 1_000_000 / (1_000_000 + u128::from(ppm)))
+                .expect("shrunk from a u64")
+        }
         _ => unreachable!("validated by caller"),
     };
     let amount_msat = params.amount_msat.min(src_movable).min(dst_bound);
@@ -233,10 +232,8 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 
     let maxfee_msat = match (params.maxfee_msat, params.maxfee_ppm) {
         (Some(msat), None) => msat,
-        (None, Some(ppm)) => {
-            u64::try_from(u128::from(amount_msat) * u128::from(ppm) / 1_000_000)
-                .map_err(|_| anyhow!("maxfee_ppm overflow"))?
-        }
+        (None, Some(ppm)) => u64::try_from(u128::from(amount_msat) * u128::from(ppm) / 1_000_000)
+            .map_err(|_| anyhow!("maxfee_ppm overflow"))?,
         _ => unreachable!("validated by caller"),
     };
 
@@ -262,8 +259,7 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     }
 
     ensure_persistent_layer(&mut rpc).await?;
-    let cutoff =
-        now_secs().saturating_sub(state.constraint_age.load(Ordering::Relaxed));
+    let cutoff = now_secs().saturating_sub(state.constraint_age.load(Ordering::Relaxed));
     call(
         &mut rpc,
         "askrene-age",
@@ -286,7 +282,13 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     );
     call(&mut rpc, "askrene-create-layer", json!({"layer": split})).await?;
     let result = plan_in_layer(
-        &mut rpc, state, &split, &self_id, &chans, params, amount_msat,
+        &mut rpc,
+        state,
+        &split,
+        &self_id,
+        &chans,
+        params,
+        amount_msat,
         maxfee_msat,
     )
     .await;
@@ -364,8 +366,7 @@ async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Erro
         if ch["state"].as_str() != Some("CHANNELD_NORMAL") {
             continue;
         }
-        let (Some(scid), Some(peer_id)) =
-            (ch["short_channel_id"].as_str(), ch["peer_id"].as_str())
+        let (Some(scid), Some(peer_id)) = (ch["short_channel_id"].as_str(), ch["peer_id"].as_str())
         else {
             continue;
         };
@@ -376,7 +377,10 @@ async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Erro
                 peer_id: peer_id.to_owned(),
                 spendable_msat: ch["spendable_msat"].as_u64().unwrap_or(0),
                 receivable_msat: ch["receivable_msat"].as_u64().unwrap_or(0),
-                remote_update: ch["updates"]["remote"].as_object().is_some().then(|| ch["updates"]["remote"].clone()),
+                remote_update: ch["updates"]["remote"]
+                    .as_object()
+                    .is_some()
+                    .then(|| ch["updates"]["remote"].clone()),
                 onion_scid: (private)
                     .then(|| ch["alias"]["remote"].as_str().map(str::to_owned))
                     .flatten(),
@@ -433,8 +437,7 @@ async fn plan_in_layer(
             onion_scids.insert(real_scidd.clone(), alias.clone());
         }
         let mirror_scid = format!("{MIRROR_BLOCK}x{}x0", n + 1);
-        let mirror_scidd =
-            format!("{mirror_scid}/{}", dir(&chan.peer_id, FAKE_US_IN));
+        let mirror_scidd = format!("{mirror_scid}/{}", dir(&chan.peer_id, FAKE_US_IN));
         call(
             rpc,
             "askrene-create-channel",
@@ -478,9 +481,8 @@ async fn plan_in_layer(
         // carry that onto the mirror, since otherwise the solver
         // applies its uniform prior to the mirror's capacity.  Same
         // cap as localchans (bounded by the peer's htlc maximum).
-        let known_msat = receivable_msat.min(
-            update["htlc_maximum_msat"].as_u64().unwrap_or(u64::MAX),
-        );
+        let known_msat =
+            receivable_msat.min(update["htlc_maximum_msat"].as_u64().unwrap_or(u64::MAX));
         if known_msat > 0 {
             call(
                 rpc,
@@ -597,10 +599,8 @@ async fn plan_in_layer(
         rung_amount = rung;
         rung_maxfee = match (params.maxfee_msat, params.maxfee_ppm) {
             (Some(msat), None) => msat,
-            (None, Some(ppm)) => u64::try_from(
-                u128::from(rung) * u128::from(ppm) / 1_000_000,
-            )
-            .expect("shrunk from a u64"),
+            (None, Some(ppm)) => u64::try_from(u128::from(rung) * u128::from(ppm) / 1_000_000)
+                .expect("shrunk from a u64"),
             _ => unreachable!("validated by caller"),
         };
         let mut getroutes = json!({
@@ -689,14 +689,13 @@ async fn plan_in_layer(
                 routes: vec![],
                 onion_scids,
                 detail: Some(detail),
-            })
+            });
         }
     };
 
     // Translate final hops back to real channels: ours is the only
     // mapping in existence, because we allocated the mirror scids.
-    let solved_routes =
-        solved["routes"].as_array().cloned().unwrap_or_default();
+    let solved_routes = solved["routes"].as_array().cloned().unwrap_or_default();
     let n_solved = solved_routes.len();
     let mut routes = Vec::with_capacity(n_solved);
     let mut delivered: u64 = 0;
@@ -741,12 +740,7 @@ async fn plan_in_layer(
         // independently: if the cheap parts fail and an expensive
         // one completes, the delivered total is priced over the
         // caller's rate.  Each part must honor the rate on its own.
-        if !part_within_rate(
-            route_fee,
-            route_delivered,
-            rung_maxfee,
-            rung_amount,
-        ) {
+        if !part_within_rate(route_fee, route_delivered, rung_maxfee, rung_amount) {
             // Per-part detail at trace; the loop exit logs one
             // summary line (an MCF solve can shed dozens of parts,
             // mostly quantization slivers priced absurdly by base
@@ -761,11 +755,8 @@ async fn plan_in_layer(
                 crate::eng(rung_amount),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
             );
-            pruned_rate_ppm.push(
-                fee_ppm(route_fee, route_delivered).unwrap_or(0),
-            );
-            pruned_rate_msat =
-                pruned_rate_msat.saturating_add(route_delivered);
+            pruned_rate_ppm.push(fee_ppm(route_fee, route_delivered).unwrap_or(0));
+            pruned_rate_msat = pruned_rate_msat.saturating_add(route_delivered);
             continue;
         }
         sent += route_sent;
@@ -870,12 +861,7 @@ mod tests {
 
     #[test]
     fn no_overflow_at_extremes() {
-        assert!(part_within_rate(
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX
-        ));
+        assert!(part_within_rate(u64::MAX, u64::MAX, u64::MAX, u64::MAX));
         assert!(!part_within_rate(u64::MAX, 1, 1, u64::MAX));
     }
 }

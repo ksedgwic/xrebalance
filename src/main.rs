@@ -45,32 +45,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// So age toward re-learning: 3 hours keeps the layer dominated by
 /// continuously re-probed knowledge, and sits just above a periodic
 /// driver's cadence so each run inherits the run before.
-const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption {
-        name: "xrebalance-constraint-age",
-        default: 3 * 60 * 60,
-        description:
-            "seconds until learned constraints in the xrebalance layer expire",
-        deprecated: false,
-        dynamic: true,
-        multi: false,
-    };
+const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-constraint-age",
+    default: 3 * 60 * 60,
+    description: "seconds until learned constraints in the xrebalance layer expire",
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
 
 /// Learned gossip overrides (policy refreshes from onion failures,
 /// node disables, channel exclusions) expire after this many
 /// seconds.  A separate knob from the constraint age: overrides
 /// assert what a peer enforces rather than where liquidity sits,
 /// and the two decay on different clocks.
-const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption {
-        name: "xrebalance-override-age",
-        default: 60 * 60,
-        description: "seconds until learned policy, node-disable, and \
+const OPT_OVERRIDE_AGE: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-override-age",
+    default: 60 * 60,
+    description: "seconds until learned policy, node-disable, and \
                       channel-exclusion overrides expire",
-        deprecated: false,
-        dynamic: true,
-        multi: false,
-    };
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
 
 /// Snapshot window: how long the RPC waits so fast outcomes appear
 /// directly in the response.  The response is only a snapshot -- the
@@ -118,16 +115,15 @@ const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
 /// backstop for feedback bugs, not the usual exit, and the default
 /// is sized for that backstop role.  maxrounds=1 requests the old
 /// single-shot behavior, response shape included.
-const OPT_MAX_ROUNDS: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption {
-        name: "xrebalance-max-rounds",
-        default: 50,
-        description: "plan-execute rounds one request may run (per-request \
+const OPT_MAX_ROUNDS: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-max-rounds",
+    default: 50,
+    description: "plan-execute rounds one request may run (per-request \
                       maxrounds overrides)",
-        deprecated: false,
-        dynamic: true,
-        multi: false,
-    };
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
 
 /// Final-hop CLTV delta granted to each part's return leg.  The
 /// htlc_accepted hook claims the HTLC the moment it arrives, but the
@@ -138,17 +134,16 @@ const OPT_MAX_ROUNDS: DefaultIntegerConfigOption =
 /// blocks a slow or flapping peer has to finish the removal before
 /// the deadline check fires; a value at or below the buffer makes
 /// every return leg a force-close race against the next block.
-const OPT_FINAL_CLTV: DefaultIntegerConfigOption =
-    DefaultIntegerConfigOption {
-        name: "xrebalance-final-cltv",
-        default: 40,
-        description: "final-hop cltv delta for return legs (slack for \
+const OPT_FINAL_CLTV: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-final-cltv",
+    default: 40,
+    description: "final-hop cltv delta for return legs (slack for \
                       the removal handshake before lightningd's \
                       fulfilled-HTLC close deadline)",
-        deprecated: false,
-        dynamic: true,
-        multi: false,
-    };
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
 
 /// Notification topic: one event per part reaching a terminal state,
 /// carrying the part's own payment_hash (parts are independent
@@ -340,12 +335,8 @@ async fn run() -> Result<(), Error> {
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
-        coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(
-            constraint_age,
-        ))),
-        overrides: Arc::new(Mutex::new(overrides::Overrides::new(
-            override_age,
-        ))),
+        coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
+        overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
     };
     let plugin = configured.start(state).await?;
@@ -416,14 +407,11 @@ async fn xrebalance(
     // (amount_msat is validated positive above).
     let budget_msat = parsed.maxfee_msat.unwrap_or_else(|| {
         u64::try_from(
-            u128::from(parsed.amount_msat)
-                * u128::from(parsed.maxfee_ppm.unwrap_or(0))
-                / 1_000_000,
+            u128::from(parsed.amount_msat) * u128::from(parsed.maxfee_ppm.unwrap_or(0)) / 1_000_000,
         )
         .unwrap_or(u64::MAX)
     });
-    let budget_ppm = u128::from(budget_msat) * 1_000_000
-        / u128::from(parsed.amount_msat);
+    let budget_ppm = u128::from(budget_msat) * 1_000_000 / u128::from(parsed.amount_msat);
     log::debug!(
         "req {}: move up to {}msat, {} sources -> {} destinations, \
          budget {}msat ({}ppm){}",
@@ -494,10 +482,7 @@ async fn xrebalance(
                 stop_reason = if remaining == 0 {
                     "amount fully committed".into()
                 } else {
-                    format!(
-                        "remaining {}msat below the fragment floor",
-                        eng(remaining)
-                    )
+                    format!("remaining {}msat below the fragment floor", eng(remaining))
                 };
                 break;
             }
@@ -507,9 +492,8 @@ async fn xrebalance(
         if let Some(pot) = parsed.maxfee_msat {
             // An absolute budget is one pot across the rounds:
             // settled and reserved (pending-part) fees come off it.
-            round_params.maxfee_msat = Some(
-                pot.saturating_sub(fee_total.saturating_add(pending_fee_total)),
-            );
+            round_params.maxfee_msat =
+                Some(pot.saturating_sub(fee_total.saturating_add(pending_fee_total)));
         }
         // Per-target limits are one pot across the rounds too.
         draw_down(&mut round_params.sources, &source_committed);
@@ -535,18 +519,14 @@ async fn xrebalance(
                     .unwrap_or("planner returned no routes"),
             );
         }
-        let outcome =
-            match exec::execute(&_plugin, &round_params, &planned, started)
-                .await
-            {
-                Ok(o) => o,
-                Err(e) if round > 1 => {
-                    stop_reason =
-                        format!("round {round} execution failed: {e}");
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
+        let outcome = match exec::execute(&_plugin, &round_params, &planned, started).await {
+            Ok(o) => o,
+            Err(e) if round > 1 => {
+                stop_reason = format!("round {round} execution failed: {e}");
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         delivered_total += outcome.delivered_msat;
         fee_total += outcome.fee_msat;
         pending_total += outcome.pending_msat;
@@ -565,9 +545,9 @@ async fn xrebalance(
                 eng(outcome.delivered_msat),
                 eng(delivered_total),
                 eng(pending_total),
-                eng(parsed.amount_msat.saturating_sub(
-                    delivered_total.saturating_add(pending_total)
-                )),
+                eng(parsed
+                    .amount_msat
+                    .saturating_sub(delivered_total.saturating_add(pending_total))),
             );
         }
         if no_routes {
@@ -641,8 +621,7 @@ async fn xrebalance_stats(
     let layer = match listed["layers"].as_array().and_then(|l| l.first()) {
         None => json!({"exists": false}),
         Some(l) => {
-            let constraints =
-                l["constraints"].as_array().cloned().unwrap_or_default();
+            let constraints = l["constraints"].as_array().cloned().unwrap_or_default();
             let minimums = constraints
                 .iter()
                 .filter(|c| c["minimum_msat"].is_u64())
@@ -652,10 +631,8 @@ async fn xrebalance_stats(
             // short-circuit at plan time).  Depth: entries stacked
             // per direction.
             let mut depth: HashMap<&str, u64> = HashMap::new();
-            let mut dirs_with_max: std::collections::HashSet<&str> =
-                Default::default();
-            let mut dirs_with_min: std::collections::HashSet<&str> =
-                Default::default();
+            let mut dirs_with_max: std::collections::HashSet<&str> = Default::default();
+            let mut dirs_with_min: std::collections::HashSet<&str> = Default::default();
             for c in &constraints {
                 let Some(d) = c["short_channel_id_dir"].as_str() else {
                     continue;
@@ -682,9 +659,7 @@ async fn xrebalance_stats(
                 .iter()
                 .filter_map(|c| c["timestamp"].as_u64())
                 .collect();
-            let count = |key: &str| {
-                l[key].as_array().map(|a| a.len()).unwrap_or(0)
-            };
+            let count = |key: &str| l[key].as_array().map(|a| a.len()).unwrap_or(0);
             json!({
                 "exists": true,
                 "constraints": constraints.len(),
@@ -750,8 +725,7 @@ async fn setconfig(
         .as_i64()
         .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
         .ok_or_else(|| anyhow!("{name}: value is not an integer"))?;
-    let value = u64::try_from(value)
-        .map_err(|_| anyhow!("{name} must not be negative"))?;
+    let value = u64::try_from(value).map_err(|_| anyhow!("{name} must not be negative"))?;
     let state = plugin.state();
     match name.as_str() {
         "xrebalance-constraint-age" => {
@@ -804,7 +778,10 @@ enum ClaimVerdict {
     /// entry is kept (a whole retry can still settle); the HTLC is
     /// left to lightningd, which fails it -- no invoice exists for
     /// the hash.
-    Underpaid { expected_msat: u64, incoming_msat: u64 },
+    Underpaid {
+        expected_msat: u64,
+        incoming_msat: u64,
+    },
     /// Not ours: pass it down the hook chain untouched.
     Pass,
 }
@@ -818,19 +795,14 @@ enum ClaimVerdict {
 /// learn the preimage anyway, and claim the full amount from its
 /// upstream, keeping the difference.  Overpayment settles: the
 /// sender loses nothing by it.
-fn try_claim(
-    claims: &mut HashMap<String, Claim>,
-    v: &serde_json::Value,
-) -> ClaimVerdict {
+fn try_claim(claims: &mut HashMap<String, Claim>, v: &serde_json::Value) -> ClaimVerdict {
     let Some(hash) = v["htlc"]["payment_hash"].as_str() else {
         return ClaimVerdict::Pass;
     };
     let Some(claim) = claims.get(hash) else {
         return ClaimVerdict::Pass;
     };
-    if v["onion"]["payment_secret"].as_str()
-        != Some(claim.payment_secret.as_str())
-    {
+    if v["onion"]["payment_secret"].as_str() != Some(claim.payment_secret.as_str()) {
         return ClaimVerdict::Pass;
     }
     // A missing or malformed amount reads as zero: never whole.

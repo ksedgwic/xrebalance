@@ -67,9 +67,7 @@ impl Overrides {
     pub fn is_repeat(&self, scidd: &str, cu: &ChanUpdate, now: u64) -> bool {
         self.policies
             .get(scidd)
-            .is_some_and(|(stored, at)| {
-                self.young(*at, now) && stored.same_policy(cu)
-            })
+            .is_some_and(|(stored, at)| self.young(*at, now) && stored.same_policy(cu))
     }
 
     /// Take the erring forwarder out of consideration for a while.

@@ -38,7 +38,10 @@ impl ChanSpec {
 
     fn from_str_form(s: &str) -> Result<Self, String> {
         let Some((scid, limit)) = s.split_once(':') else {
-            return Ok(ChanSpec { scid: s.to_owned(), max_msat: None });
+            return Ok(ChanSpec {
+                scid: s.to_owned(),
+                max_msat: None,
+            });
         };
         if scid.is_empty() {
             return Err(format!("\"{s}\": missing scid before ':'"));
@@ -61,9 +64,7 @@ impl ChanSpec {
             Value::Object(m) => {
                 for k in m.keys() {
                     if k != "scid" && k != "max_msat" {
-                        return Err(format!(
-                            "unknown field \"{k}\" (expected scid, max_msat)"
-                        ));
+                        return Err(format!("unknown field \"{k}\" (expected scid, max_msat)"));
                     }
                 }
                 let scid = m
@@ -130,7 +131,10 @@ mod tests {
     }
 
     fn spec(scid: &str, max_msat: Option<u64>) -> ChanSpec {
-        ChanSpec { scid: scid.to_owned(), max_msat }
+        ChanSpec {
+            scid: scid.to_owned(),
+            max_msat,
+        }
     }
 
     #[test]
@@ -180,13 +184,13 @@ mod tests {
     #[test]
     fn bad_strings_are_rejected() {
         for bad in [
-            r#""845123x1x0:""#,          // empty limit
-            r#"":100000""#,              // empty scid
-            r#""845123x1x0:1:2""#,       // two colons
-            r#""845123x1x0:12.5sat""#,   // fractional
-            r#""845123x1x0:-1""#,        // negative
-            r#""845123x1x0:sat""#,       // no digits
-            r#""845123x1x0:99btc""#,     // unsupported unit
+            r#""845123x1x0:""#,        // empty limit
+            r#"":100000""#,            // empty scid
+            r#""845123x1x0:1:2""#,     // two colons
+            r#""845123x1x0:12.5sat""#, // fractional
+            r#""845123x1x0:-1""#,      // negative
+            r#""845123x1x0:sat""#,     // no digits
+            r#""845123x1x0:99btc""#,   // unsupported unit
         ] {
             assert!(parse(bad).is_err(), "accepted {bad}");
         }

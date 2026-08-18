@@ -85,8 +85,7 @@ impl Coalescer {
         is_lower_bound: bool,
     ) -> Option<u64> {
         let bucket = now_secs / self.bucket_secs;
-        if !should_emit(self.cache.get(key), bucket, amount_msat, is_lower_bound)
-        {
+        if !should_emit(self.cache.get(key), bucket, amount_msat, is_lower_bound) {
             return None;
         }
         self.emits += 1;

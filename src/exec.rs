@@ -33,8 +33,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use crate::onion_error::{
-    classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate,
-    FeeFault,
+    classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate, FeeFault,
 };
 use crate::plan::{fee_ppm, PlanResult, PERSISTENT_LAYER};
 use crate::{eng, Claim, State, XRebalanceParams, TOPIC_PART};
@@ -217,10 +216,9 @@ fn erring_hop_index(part: &Part, data: &Value) -> Option<usize> {
         return None;
     };
     let erring_scidd = format!("{chan}/{dir}");
-    part.hops.iter().position(|h| {
-        h.scidd == erring_scidd
-            || format!("{}/{dir}", h.onion_scid) == erring_scidd
-    })
+    part.hops
+        .iter()
+        .position(|h| h.scidd == erring_scidd || format!("{}/{dir}", h.onion_scid) == erring_scidd)
 }
 
 /// Count one feedback write toward the request loop's stall check
@@ -233,21 +231,15 @@ fn note_feedback(state: &State) {
 /// One best-effort inform-channel write into the persistent layer,
 /// coalesced: a bound already accepted this bucket and not tightened
 /// by this observation is dropped (coalesce.rs).
-async fn inform(
-    state: &State,
-    rpc: &mut ClnRpc,
-    scidd: &str,
-    amount_msat: u64,
-    kind: &str,
-) {
+async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: &str) {
     let key = format!("{scidd}|{kind}");
     let is_lower_bound = kind != "constrained";
-    let Some(bucket) = state
-        .coalescer
-        .lock()
-        .expect("coalescer lock")
-        .check(&key, now_secs(), amount_msat, is_lower_bound)
-    else {
+    let Some(bucket) = state.coalescer.lock().expect("coalescer lock").check(
+        &key,
+        now_secs(),
+        amount_msat,
+        is_lower_bound,
+    ) else {
         return;
     };
     match rpc
@@ -318,7 +310,10 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
         None => {
             for hop in part.hops.iter().filter(|h| !h.ours) {
                 inform(
-                    state, &mut rpc, &hop.scidd, hop.amount_msat,
+                    state,
+                    &mut rpc,
+                    &hop.scidd,
+                    hop.amount_msat,
                     "unconstrained",
                 )
                 .await;
@@ -358,7 +353,10 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             };
             for hop in part.hops[..transit_end].iter().filter(|h| !h.ours) {
                 inform(
-                    state, &mut rpc, &hop.scidd, hop.amount_msat,
+                    state,
+                    &mut rpc,
+                    &hop.scidd,
+                    hop.amount_msat,
                     "unconstrained",
                 )
                 .await;
@@ -393,8 +391,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 // could not pass; a dead next-channel is excluded
                 // outright (1msat), aging out like any constraint.
                 let msat = if dead_next { 1 } else { erring.amount_msat };
-                inform(state, &mut rpc, &erring.scidd, msat, "constrained")
-                    .await;
+                inform(state, &mut rpc, &erring.scidd, msat, "constrained").await;
             }
         }
     }
@@ -439,12 +436,7 @@ fn record_exclusion(state: &State, scidd: &str) {
 /// may be the true cause.  A wrong exclusion costs one candidate
 /// hop for one override-age and self-heals; not blocking the true
 /// offender costs a failed part per request, indefinitely.
-fn apply_fee_insufficient(
-    state: &State,
-    part: &Part,
-    erring_idx: usize,
-    data: &Value,
-) {
+fn apply_fee_insufficient(state: &State, part: &Part, erring_idx: usize, data: &Value) {
     let erring = &part.hops[erring_idx];
     let incoming = erring_idx.checked_sub(1).map(|i| &part.hops[i]);
     let out_msat = erring.amount_msat;
@@ -484,9 +476,7 @@ fn apply_fee_insufficient(
             store_or_escalate(state, erring, cu);
         }
         FeeFault::Unattributed => {
-            for hop in
-                std::iter::once(erring).chain(incoming).filter(|h| !h.ours)
-            {
+            for hop in std::iter::once(erring).chain(incoming).filter(|h| !h.ours) {
                 record_exclusion(state, &hop.scidd);
                 log::debug!(
                     "fee_insufficient at {}: blanked or absent update; \
@@ -535,15 +525,9 @@ fn store_or_escalate(state: &State, hop: &PartHop, cu: ChanUpdate) {
 /// the policy cannot be refreshed; exclude the direction for a
 /// while instead -- otherwise askrene keeps re-proposing a channel
 /// the forwarder just refused.
-fn apply_policy_refresh(
-    state: &State,
-    part: &Part,
-    erring_idx: usize,
-    data: &Value,
-) {
+fn apply_policy_refresh(state: &State, part: &Part, erring_idx: usize, data: &Value) {
     let erring = &part.hops[erring_idx];
-    let Some(cu) = data["raw_message"].as_str().and_then(parse_chan_update)
-    else {
+    let Some(cu) = data["raw_message"].as_str().and_then(parse_chan_update) else {
         if !erring.ours {
             record_exclusion(state, &erring.scidd);
             log::debug!(
@@ -610,8 +594,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             Some(c) => format!(": {:<25} ({c:#x})", failcode_name(c)),
             None => String::new(),
         };
-        let planned_fee =
-            part.planned_sent_msat.saturating_sub(part.planned_msat);
+        let planned_fee = part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
             "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
              {:>13} msat ({:>6} ppm)",
@@ -682,9 +665,7 @@ async fn background_watch(
     notify_part(&plugin, &label, &part).await;
     match (part.status, &fail_data) {
         ("complete", _) => apply_feedback(plugin.state(), &part, None).await,
-        ("failed", Some(data)) => {
-            apply_feedback(plugin.state(), &part, Some(data)).await
-        }
+        ("failed", Some(data)) => apply_feedback(plugin.state(), &part, Some(data)).await,
         _ => {}
     }
 }
@@ -720,14 +701,11 @@ fn scid_of(scidd: &str) -> String {
 /// amounts are spoken for; if it later fails, the request
 /// under-delivers through that target rather than overshooting its
 /// limit.
-fn committed_by_target(
-    parts: &[Part],
-) -> (HashMap<String, u64>, HashMap<String, u64>) {
+fn committed_by_target(parts: &[Part]) -> (HashMap<String, u64>, HashMap<String, u64>) {
     let mut by_source: HashMap<String, u64> = HashMap::new();
     let mut by_dest: HashMap<String, u64> = HashMap::new();
     for p in parts.iter().filter(|p| p.status != "failed") {
-        *by_source.entry(scid_of(&p.first_hop)).or_default() +=
-            p.planned_sent_msat;
+        *by_source.entry(scid_of(&p.first_hop)).or_default() += p.planned_sent_msat;
         *by_dest.entry(scid_of(&p.return_hop)).or_default() += p.planned_msat;
     }
     (by_source, by_dest)
@@ -735,10 +713,8 @@ fn committed_by_target(
 
 /// Bundle the terminal render with the cross-round totals.
 fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> ExecOutcome {
-    let pending: Vec<&Part> =
-        parts.iter().filter(|p| p.status == "pending").collect();
-    let (source_committed_msat, dest_committed_msat) =
-        committed_by_target(parts);
+    let pending: Vec<&Part> = parts.iter().filter(|p| p.status == "pending").collect();
+    let (source_committed_msat, dest_committed_msat) = committed_by_target(parts);
     ExecOutcome {
         delivered_msat: parts.iter().map(Part::delivered_msat).sum(),
         fee_msat: parts.iter().map(Part::fee_msat).sum(),
@@ -815,11 +791,8 @@ pub async fn execute(
             .iter()
             .enumerate()
             .map(|(h, hop)| {
-                let scidd = hop["short_channel_id_dir"]
-                    .as_str()
-                    .unwrap_or_default();
-                let scid =
-                    scidd.split_once('/').map(|(s, _)| s).unwrap_or_default();
+                let scidd = hop["short_channel_id_dir"].as_str().unwrap_or_default();
+                let scid = scidd.split_once('/').map(|(s, _)| s).unwrap_or_default();
                 PartHop {
                     scidd: scidd.to_owned(),
                     onion_scid: plan
@@ -951,9 +924,7 @@ pub async fn execute(
             notify_part(plugin, &params.label, part).await;
             match (part.status, &fail_data) {
                 ("complete", _) => apply_feedback(state, part, None).await,
-                ("failed", Some(data)) => {
-                    apply_feedback(state, part, Some(data)).await
-                }
+                ("failed", Some(data)) => apply_feedback(state, part, Some(data)).await,
                 _ => {}
             }
         }
@@ -964,8 +935,7 @@ pub async fn execute(
     // part settling later only shows up minutes down the log).
     if !parts.is_empty() {
         let req = params.label.as_deref().unwrap_or("?");
-        let outstanding =
-            parts.iter().filter(|p| p.status == "pending").count();
+        let outstanding = parts.iter().filter(|p| p.status == "pending").count();
         let elapsed = started.elapsed().as_secs_f64();
         if outstanding == 0 {
             log::debug!(
@@ -986,8 +956,7 @@ pub async fn execute(
     // follows it to its terminal state and emits its notification.
     for part in parts.iter_mut().filter(|p| p.status == "pending") {
         if part.detail.is_none() {
-            part.detail =
-                Some("in flight; result follows via notification".into());
+            part.detail = Some("in flight; result follows via notification".into());
         }
         tokio::spawn(background_watch(
             plugin.clone(),
@@ -1043,12 +1012,8 @@ mod tests {
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
             feedback_writes: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),
-            coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(
-                6 * 60 * 60,
-            ))),
-            overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(
-                3600,
-            ))),
+            coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(6 * 60 * 60))),
+            overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(3600))),
             self_id: Arc::new(OnceLock::new()),
         }
     }
@@ -1094,8 +1059,7 @@ mod tests {
         in_flight.status = "pending";
         let mut failed = settled.clone();
         failed.status = "failed";
-        let (by_source, by_dest) =
-            committed_by_target(&[settled, in_flight, failed]);
+        let (by_source, by_dest) = committed_by_target(&[settled, in_flight, failed]);
         // Keyed by scid (limits name channels, not directions);
         // sources count sent, destinations delivered; the failed
         // part contributes nothing.

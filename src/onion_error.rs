@@ -51,8 +51,7 @@ impl ChanUpdate {
             && self.cltv_expiry_delta == o.cltv_expiry_delta
             && self.htlc_minimum_msat == o.htlc_minimum_msat
             && self.fee_base_msat == o.fee_base_msat
-            && self.fee_proportional_millionths
-                == o.fee_proportional_millionths
+            && self.fee_proportional_millionths == o.fee_proportional_millionths
             && self.htlc_maximum_msat == o.htlc_maximum_msat
     }
 }
@@ -268,12 +267,7 @@ mod tests {
     /// Wrap a channel_update in an onion failure payload: failcode
     /// + `header` zero bytes + 2-byte length + optional 0x0102
     /// type prefix + the update.
-    fn make_onion_hex(
-        failcode: u16,
-        header: usize,
-        cu: &[u8],
-        type_prefix: bool,
-    ) -> String {
+    fn make_onion_hex(failcode: u16, header: usize, cu: &[u8], type_prefix: bool) -> String {
         let mut m = Vec::new();
         push_be(&mut m, u64::from(failcode), 2);
         m.extend(std::iter::repeat(0u8).take(header));
@@ -303,8 +297,7 @@ mod tests {
     #[test]
     fn happy_path_100c_with_type_prefix() {
         let body = make_cu_body(false, 144, 1000, 1234, 567, 1_000_000_000);
-        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).unwrap();
         assert!(cu.enabled);
         assert_eq!(cu.cltv_expiry_delta, 144);
         assert_eq!(cu.htlc_minimum_msat, 1000);
@@ -317,8 +310,7 @@ mod tests {
     #[test]
     fn no_type_prefix_via_100d() {
         let body = make_cu_body(true, 40, 1, 0, 100, 21_000_000);
-        let cu = parse_chan_update(&make_onion_hex(0x100d, 4, &body, false))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100d, 4, &body, false)).unwrap();
         assert!(!cu.enabled);
         assert_eq!(cu.cltv_expiry_delta, 40);
         assert_eq!(cu.fee_proportional_millionths, 100);
@@ -327,24 +319,17 @@ mod tests {
     #[test]
     fn absurd_proportional_fee_rejected() {
         let body = make_cu_body(false, 144, 0, 0, 1_000_001, 1);
-        assert!(
-            parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-                .is_none()
-        );
+        assert!(parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).is_none());
         // Exactly 100% is still accepted.
         let body = make_cu_body(false, 144, 0, 0, 1_000_000, 1);
-        assert!(
-            parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-                .is_some()
-        );
+        assert!(parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).is_some());
     }
 
     #[test]
     fn inbound_fee_tlv_signed_values() {
         let mut body = make_cu_body(false, 144, 0, 0, 0, 1);
         push_inbound_tlv(&mut body, 8, -1000, 250);
-        let cu = parse_chan_update(&make_onion_hex(0x100b, 8, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100b, 8, &body, true)).unwrap();
         assert_eq!(cu.inbound_fee, Some((-1000, 250)));
     }
 
@@ -352,8 +337,7 @@ mod tests {
     fn inbound_tlv_wrong_length_ignored() {
         let mut body = make_cu_body(false, 144, 0, 0, 0, 1);
         push_inbound_tlv(&mut body, 9, 1000, 250);
-        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).unwrap();
         assert!(cu.inbound_fee.is_none());
     }
 
@@ -366,16 +350,14 @@ mod tests {
         push_be(&mut body, u64::MAX, 8);
         // 8 in-bounds bytes a wrapped bounds check would misread.
         push_be(&mut body, 0x1122334455667788, 8);
-        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).unwrap();
         assert!(cu.inbound_fee.is_none());
     }
 
     #[test]
     fn channel_disabled_via_1014() {
         let body = make_cu_body(true, 144, 0, 0, 0, 1);
-        let cu = parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x1014, 2, &body, true)).unwrap();
         assert!(!cu.enabled);
     }
 
@@ -384,23 +366,16 @@ mod tests {
         // The 128-byte all-zero form seen in the wild (legacy
         // layout, no htlc_maximum_msat).
         let body = vec![0u8; 128];
-        assert!(
-            parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
-                .is_none()
-        );
+        assert!(parse_chan_update(&make_onion_hex(0x1014, 2, &body, true)).is_none());
         // A full-size zeroed body falls to the timestamp check.
         let body = vec![0u8; 136];
-        assert!(
-            parse_chan_update(&make_onion_hex(0x1014, 2, &body, true))
-                .is_none()
-        );
+        assert!(parse_chan_update(&make_onion_hex(0x1014, 2, &body, true)).is_none());
     }
 
     #[test]
     fn same_policy_excludes_inbound_fee() {
         let body = make_cu_body(false, 144, 1000, 10, 20, 30);
-        let a = parse_chan_update(&make_onion_hex(0x1007, 0, &body, true))
-            .unwrap();
+        let a = parse_chan_update(&make_onion_hex(0x1007, 0, &body, true)).unwrap();
         let mut b = a.clone();
         assert!(a.same_policy(&b));
         b.inbound_fee = Some((5000, 0));
@@ -412,10 +387,7 @@ mod tests {
     #[test]
     fn non_carrying_failcode_rejected() {
         let body = make_cu_body(false, 144, 0, 0, 0, 1);
-        assert!(
-            parse_chan_update(&make_onion_hex(0x2002, 0, &body, true))
-                .is_none()
-        );
+        assert!(parse_chan_update(&make_onion_hex(0x2002, 0, &body, true)).is_none());
     }
 
     #[test]
@@ -447,8 +419,7 @@ mod tests {
     #[test]
     fn classify_covered_outbound_is_inbound() {
         let body = make_cu_body(false, 144, 0, 100, 500, 1);
-        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true))
-            .unwrap();
+        let cu = parse_chan_update(&make_onion_hex(0x100c, 8, &body, true)).unwrap();
         // required = 100 + 500 * 1_000_000 / 1_000_000 = 600.
         assert!(matches!(
             classify_fee_insufficient(600, 1_000_000, Some(&cu)),
