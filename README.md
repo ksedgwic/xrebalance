@@ -1,58 +1,104 @@
-# xrebalance — the tenacious executor
+# xrebalance — askrene adapted for circular routing
 
 A Core Lightning plugin that moves funds between a node's own channels
 via independent circular self-payments, using
 [askrene](https://docs.corelightning.org/reference/lightning-getroutes)
-for route computation.  The circular routing is expressed entirely
-through the public askrene layer API.
+for route computation.  askrene only solves point-to-point, so
+xrebalance adapts it by *node splitting*: each request builds a
+layer that splits the local node into its two roles — the real node
+originates the route, and a stand-in for its inbound side
+terminates it, reachable only through copies of the chosen
+destination channels.  Any route from the one to the other is, on
+the wire, a circle back to the local node.  The adaptation is
+expressed entirely through the public askrene layer API — no
+askrene changes.  Runs on stock `lightningd`, v26.04 or later.
 
-**Status: pre-alpha scaffold.**  The plugin loads (dynamically) and
-the RPC interface parses; planning and execution are under
-construction.
+## Quick start
 
-## The idea
+Fill a depleted channel from a few well-stocked ones, spending at
+most 300 ppm in fees:
 
-xrebalance is the *executor* half of rebalancing, in the spirit of
-xpay: callers say which channels to drain, which to fill, how much,
-and at what price; xrebalance handles the how.  Strategy — choosing
-channels, timing, budgets — belongs to higher-level tools.
+    lightning-cli -k xrebalance \
+        sources='["803480x1657x1", "805961x1795x1", "806464x855x0"]' \
+        destinations='["848864x3313x1"]' \
+        amount_msat=1000000000 \
+        maxfee_ppm=300
 
-Design points:
+One solve decides how much to draw through each source; whatever
+the network can actually carry moves, and the response reports what
+was delivered, what it cost, and each part's fate.  Add
+`dryrun=true` to see the identical plan without moving funds.
 
-- **Plural sources and destinations.**  One min-cost-flow solve can
-  drain several channels into several others.
-- **Per-channel caps.**  Any source or destination can carry a limit
-  on how much this request moves through it, asserted as an askrene
-  constraint so the solver plans around it rather than xrebalance
-  post-filtering routes.  A cap bounds the whole request: later
-  rounds see it drawn down by what earlier rounds already committed
-  through the channel.
+To build and load the plugin, see [Build and run](#build-and-run).
+
+## Why xrebalance
+
+xrebalance is a low-level rebalance executor, in the spirit of
+xpay: it is meant to be driven by a high-level rebalancer that owns
+the *strategy* — which channels to drain, which to fill, how much,
+at what price, when — while xrebalance owns the *tactics*: routing,
+splitting into parts, claiming, retrying, and learning from what
+each attempt taught.
+
+- **Strict fees.**  `maxfee_ppm` (or `maxfee_msat`) is enforced at
+  the askrene quote and again post-route; no per-part slippage.
+- **Batch rebalancing.**  A request considers all its sources and
+  destinations at once — one min-cost-flow solve, free to split the
+  amount across every pairing; per-channel caps, drawn down across
+  the request, keep any single channel from over-balancing.
+- **Learns the network.**  Part outcomes feed a persistent askrene
+  layer and a short-lived override store; retries route better
+  than first attempts, within a request and across requests.
 - **Partial success is the semantic.**  `amount_msat` is a ceiling;
   every settled part is banked liquidity; zero delivered is a
   result, not an error.
-- **Strict fees.**  The budget is enforced at the askrene quote and
-  again post-route; no per-part slippage.
-- **Feedback.**  Part outcomes are written back -- liquidity facts
-  to a persistent askrene layer, policy facts (refreshes, node
-  disables, channel exclusions) to a shorter-lived in-memory store
-  -- so retries route better than first attempts.
-- **Tenacity.**  A request may run several plan-execute rounds
-  (`maxrounds`), each replanning the still-unmoved remainder
-  against what the earlier rounds' failures taught, until the
-  amount moves, the planner proves it cannot, or a round learns
-  nothing.  Non-dryrun requests serialize: one at a time, later
-  ones queue -- and the RPC blocks through the rounds, which is
-  what paces a sequential driver.
+- **Tenacious.**  Up to `maxrounds` plan-execute rounds replan the
+  still-unmoved remainder; non-dryrun requests serialize, and the
+  RPC blocks through the rounds — which is what paces a driver.
+- **Independent parts.**  Each part has its own preimage and
+  payment_hash — never an MPP set.  A shared hash would let a node
+  routing two parts claim the second the moment the first settles;
+  per-part preimages close that window.
+- **A fragment floor.**  No part delivers less than
+  `xrebalance-min-part-msat` — a guard against plans fragmenting
+  into a spray of tiny, inefficient transfers.
+- **Dryrun fidelity.**  A dryrun runs the identical planner; its
+  result is what execution would have pursued.
+- **Per-part notifications.**  Each part's resolution is broadcast
+  as an `xrebalance_part` notification — the feedback a high-level
+  rebalancer needs to keep accurate books without polling.
 
-## Interface (settling — subject to change)
+### What xrebalance handles
+
+| when a request sees … | xrebalance … |
+|---|---|
+| a part settle | records every hop's proven liquidity in the persistent layer — success history that later plans, and later requests, build on |
+| a hop report insufficient liquidity | records the bound at the blocking hop — and the proven liquidity of every hop the part cleared on the way there — then replans the remainder |
+| a failure expose stale gossip — it carries the outgoing channel's current fees/CLTV | overrides the stale values so the next plan prices the hop correctly; a policy that "refreshes" to the same values is not fresher, and escalates to exclusion |
+| a forwarder report the next channel gone (`unknown_next_peer`) while gossip still advertises it | temporarily excludes the channel |
+| a peer charge a positive inbound fee — a surcharge the sender cannot price, so the hop fails `fee_insufficient` every time | temporarily excludes the surcharging incoming channel |
+| a `fee_insufficient` with its channel_update blanked (some forwarders zero it for privacy) | cannot tell stale gossip from an inbound fee, so temporarily excludes both candidate channels — a failure must teach something, or the next plan repeats it, while over-excluding heals |
+| a hop return a node-level error (`temporary_node_failure`, …) | temporarily disables the node — excluding one channel would just re-route through the same node's other channels |
+| the returning HTLC offer less than the part delivered | declines to settle it — releasing the preimage against a short HTLC would let the last-hop peer claim the full amount upstream |
+| no usable route at the asked amount (getroutes 205) | descends a ladder — 3/4, 1/2, 1/4, 1/8 of the amount — and plans the first amount the network can carry; a ladder run dry ends the request |
+| routes only over the fee budget (getroutes 206) | stops rather than descending: base fees weigh more at smaller amounts, so cheaper routes do not appear further down |
+
+All of this self-heals: exclusions and node disables expire after
+`xrebalance-override-age`, learned liquidity after
+`xrebalance-constraint-age` — as the network heals, its channels
+and nodes come automatically back into the plans.  Nothing is
+written off forever.
+
+## Interface
 
     xrebalance sources=[src,...] destinations=[dst,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
                [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
                [maxrounds=N]
 
-Each `src`/`dst` element names one of our channels, optionally with
-a cap on how much this request moves through it — at most that much
+Each `src`/`dst` element names one of the local node's channels,
+optionally with a cap on how much this request moves through it —
+at most that much
 drawn from a source, at most that much delivered into a destination.
 Three equivalent spellings:
 
@@ -101,13 +147,10 @@ do not appear further down.
 
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.
-(Sharing one hash would let a node on a settled part's path steal a
-still-in-flight part routed through it; per-part preimages close
-that window, and intermediates cannot even correlate the parts.)
-A part settles only when the arriving HTLC offers its full
-delivered amount: the last-hop peer chooses the HTLC amount, and
-settling a short one would hand that peer the preimage to claim
-the full amount from its upstream.
+"Why xrebalance" above gives the security reasons (preimage replay,
+short-HTLC claims); a further consequence is that intermediates
+cannot even correlate the parts.  Returning parts are claimed via
+the `htlc_accepted` hook — the plugin's only hook.
 
 One `xrebalance_part` notification is broadcast per part reaching a
 terminal state, carrying the part's own payment_hash, its
