@@ -25,9 +25,10 @@ most 300 ppm in fees:
         maxfee_ppm=300
 
 One solve decides how much to draw through each source; whatever
-the network can actually carry moves, and the response reports what
-was delivered, what it cost, and each part's fate.  Add
-`dryrun=true` to see the identical plan without moving funds.
+the network can actually carry moves, and the response summarizes
+what was delivered, what it cost, and — if nothing moved — where
+the attempt came nearest to landing.  Add `dryrun=true` to see the
+identical plan without moving funds.
 
 To build and load the plugin, see [Build and run](#build-and-run).
 
@@ -94,7 +95,7 @@ written off forever.
     xrebalance sources=[src,...] destinations=[dst,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
                [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
-               [maxrounds=N]
+               [maxrounds=N] [verbose=true]
 
 Each `src`/`dst` element names one of the local node's channels,
 optionally with a cap on how much this request moves through it —
@@ -159,11 +160,16 @@ amounts, status, and the caller's `label` — the request-level
 correlator, and enough for callers to keep accurate per-channel
 books without polling.
 
-The response is a snapshot: the plan, each part's payment_hash (its
-durable handle), and whatever resolved within the snapshot window —
-`part_wait` seconds (0 = return immediately), defaulting to the
-`xrebalance-part-wait` option.  Parts still pending detach and keep
-settling; their notifications fire when they land.
+The response leads with the outcome: request totals plus a
+`summary` block — round and part counts, delivered and fee totals,
+and, when nothing moved, a `closest_miss` naming the failed part
+that came nearest to landing.  `verbose=true` adds the per-round
+detail: each round's parts with their payment_hashes (the durable
+handles) and failure geometry.  Either way the response is a
+snapshot bounded by the window — `part_wait` seconds (0 = return
+immediately), defaulting to the `xrebalance-part-wait` option —
+and parts still pending detach and keep settling; their
+notifications fire when they land.
 
 Options (all dynamic -- adjustable at runtime via `lightning-cli
 setconfig`, so tuning never requires a plugin restart):

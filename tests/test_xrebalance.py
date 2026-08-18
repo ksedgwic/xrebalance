@@ -379,8 +379,9 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     runs multiple rounds -- round 1 moves what fits, a later round
     replans the remainder, finds the sources and destination
     exhausted, and stops with a reason instead of an error.  The
-    multi-round response carries per-round snapshots plus request
-    totals; maxrounds=1 keeps the old shape.
+    multi-round response carries request totals plus a summary;
+    verbose=true adds the per-round snapshots; maxrounds=1 keeps
+    the old shape.
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
@@ -396,12 +397,15 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
                             amount_msat=2_000_000_000,
                             maxfee_msat=100_000,
-                            maxrounds=5, label='tenacious')
+                            maxrounds=5, verbose=True, label='tenacious')
     assert res['status'] == 'executed', res
     assert res['rounds_run'] == len(res['rounds']), res
     assert 2 <= res['rounds_run'] <= 4, res
     assert res['delivered_msat'] >= 500_000_000, res
     assert res['stop_reason'], res
+    assert res['summary']['rounds'] == res['rounds_run'], res
+    assert res['summary']['delivered_msat'] == res['delivered_msat'], res
+    assert res['summary']['parts_complete'] >= 1, res
     l1.daemon.wait_for_log(r"req tenacious: round 1/5: delivered")
     l1.daemon.wait_for_log(r"req tenacious: finished after \d+ round")
 
@@ -432,6 +436,9 @@ def test_limits_across_rounds(node_factory, bitcoind, xrebalance_plugin,
                             maxfee_msat=100_000,
                             maxrounds=5, label='capped')
     assert res['status'] == 'executed', res
+    # Default response is brief: totals and summary, no round detail.
+    assert 'rounds' not in res, res
+    assert res['summary']['parts_complete'] >= 1, res
     # The cap-exhausted stop takes at least one extra round to see.
     assert 2 <= res['rounds_run'] <= 5, res
     # Something substantial moved...

@@ -247,6 +247,14 @@ pub struct XRebalanceParams {
     /// xrebalance_part notification either way.
     #[serde(default)]
     part_wait: Option<u64>,
+    /// Include the per-round detail (each round with its parts) in
+    /// the multi-round response.  Off by default: the response then
+    /// carries the request totals and the summary block, and
+    /// per-part detail remains available on the xrebalance_part
+    /// notification stream.  maxrounds=1's single-shot response is
+    /// unchanged either way.
+    #[serde(default)]
+    verbose: Option<bool>,
 }
 
 /// Group digits with '_' for log readability: 10005958 -> 10_005_958.
@@ -579,7 +587,7 @@ async fn xrebalance(
     }
     log::debug!("req {req}: finished after {round} round(s): {stop_reason}");
     let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": "executed",
         "label": parsed.label,
         "amount_msat": parsed.amount_msat,
@@ -589,9 +597,12 @@ async fn xrebalance(
         "fee_msat": fee_total,
         "fee_ppm": plan::fee_ppm(fee_total, delivered_total),
         "pending_msat": pending_total,
-        "rounds": rounds,
         "summary": summary,
-    }))
+    });
+    if parsed.verbose.unwrap_or(false) {
+        response["rounds"] = serde_json::Value::Array(rounds);
+    }
+    Ok(response)
 }
 
 /// Digest a multi-round request into the few numbers a caller scans
