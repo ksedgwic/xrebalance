@@ -42,12 +42,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// corridor to one failed part.  Stale pessimism (a max bound on a
 /// corridor that has since refilled) silently prunes routes until
 /// it expires; stale optimism is rewritten by the first failure.
-/// So age toward re-learning: 3 hours keeps the layer dominated by
-/// continuously re-probed knowledge, and sits just above a periodic
-/// driver's cadence so each run inherits the run before.
+/// So age toward re-learning, but give knowledge time to be used:
+/// 6 hours spans several runs of a periodic driver, so each run
+/// inherits the runs before instead of restarting the map — in the
+/// field, 3 hours expired corridors faster than routine traffic
+/// re-probed them.
 const OPT_CONSTRAINT_AGE: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     name: "xrebalance-constraint-age",
-    default: 3 * 60 * 60,
+    default: 6 * 60 * 60,
     description: "seconds until learned constraints in the xrebalance layer expire",
     deprecated: false,
     dynamic: true,

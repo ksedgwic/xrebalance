@@ -175,7 +175,7 @@ Options (all dynamic -- adjustable at runtime via `lightning-cli
 setconfig`, so tuning never requires a plugin restart):
 
     xrebalance-constraint-age=<seconds>   # expiry of learned constraints
-                                          # (10800)
+                                          # (21600)
     xrebalance-override-age=<seconds>     # expiry of learned overrides:
                                           # policy refreshes, node disables,
                                           # channel exclusions (3600)
