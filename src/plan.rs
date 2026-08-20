@@ -144,6 +144,45 @@ fn part_within_length(n_hops: usize) -> bool {
     n_hops <= MAX_SAFE_HOPS
 }
 
+/// Complete the per-hop fields a pre-v26.06 getroutes leaves out.
+///
+/// CLN v26.06 gave each hop explicit in/out fields (node_id_out,
+/// amount_in_msat / amount_out_msat, cltv_in / cltv_out) and
+/// deprecated the old trio (next_node_id, amount_msat, delay) --
+/// all a stock v26.04 hop carries.  The plugin reads the new names
+/// only, so without this every v26.04 request would die at the
+/// final-hop check with a misleading "does not end at the split
+/// node".  The derivation is an identity, not a guess: the old
+/// amount_msat and delay ARE the hop's in-amount and in-cltv, the
+/// next hop's in-values are this hop's out-values, and the final
+/// hop's out-values are the route's delivered amount_msat and
+/// final_cltv (both required in the v26.04 schema).  Dead code on
+/// v26.06+, whose hops already carry the new fields.
+fn complete_hop_fields(route: &mut Value) {
+    let Some(path) = route["path"].as_array() else {
+        return;
+    };
+    if path.iter().all(|hop| hop.get("node_id_out").is_some()) {
+        return;
+    }
+    let mut outs: Vec<(Value, Value)> = path
+        .iter()
+        .skip(1)
+        .map(|hop| (hop["amount_msat"].clone(), hop["delay"].clone()))
+        .collect();
+    outs.push((route["amount_msat"].clone(), route["final_cltv"].clone()));
+    let Some(path) = route["path"].as_array_mut() else {
+        return;
+    };
+    for (hop, (amount_out, cltv_out)) in path.iter_mut().zip(outs) {
+        hop["node_id_out"] = hop["next_node_id"].clone();
+        hop["amount_in_msat"] = hop["amount_msat"].clone();
+        hop["cltv_in"] = hop["delay"].clone();
+        hop["amount_out_msat"] = amount_out;
+        hop["cltv_out"] = cltv_out;
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -706,6 +745,7 @@ async fn plan_in_layer(
     let mut pruned_rate_ppm: Vec<u64> = Vec::new();
     let mut pruned_rate_msat: u64 = 0;
     for mut route in solved_routes {
+        complete_hop_fields(&mut route);
         let path = route["path"]
             .as_array_mut()
             .ok_or_else(|| anyhow!("getroutes: route without path"))?;
@@ -812,7 +852,8 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{fee_ppm, part_within_length, part_within_rate};
+    use super::{complete_hop_fields, fee_ppm, part_within_length, part_within_rate};
+    use serde_json::json;
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
     #[test]
@@ -863,5 +904,95 @@ mod tests {
     fn no_overflow_at_extremes() {
         assert!(part_within_rate(u64::MAX, u64::MAX, u64::MAX, u64::MAX));
         assert!(!part_within_rate(u64::MAX, 1, 1, u64::MAX));
+    }
+
+    // A stock v26.04 route: hops carry only the deprecated trio.
+    // Two hops, 1000msat fee at the first, 500 at the second.
+    fn v2604_route() -> serde_json::Value {
+        json!({
+            "probability_ppm": 900_000,
+            "amount_msat": 100_000,
+            "final_cltv": 18,
+            "path": [
+                {
+                    "short_channel_id_dir": "100x1x0/1",
+                    "next_node_id": "02bb",
+                    "amount_msat": 101_500,
+                    "delay": 60,
+                },
+                {
+                    "short_channel_id_dir": "200x1x0/0",
+                    "next_node_id": "02cc",
+                    "amount_msat": 100_500,
+                    "delay": 40,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn v2604_hops_gain_the_in_out_fields() {
+        let mut route = v2604_route();
+        complete_hop_fields(&mut route);
+        let path = route["path"].as_array().unwrap();
+        // Hop 0: in = its own trio, out = hop 1's in-values.
+        assert_eq!(path[0]["node_id_out"], json!("02bb"));
+        assert_eq!(path[0]["amount_in_msat"], json!(101_500));
+        assert_eq!(path[0]["cltv_in"], json!(60));
+        assert_eq!(path[0]["amount_out_msat"], json!(100_500));
+        assert_eq!(path[0]["cltv_out"], json!(40));
+        // Hop 1 (final): out = the route's delivered amount / final_cltv.
+        assert_eq!(path[1]["node_id_out"], json!("02cc"));
+        assert_eq!(path[1]["amount_in_msat"], json!(100_500));
+        assert_eq!(path[1]["cltv_in"], json!(40));
+        assert_eq!(path[1]["amount_out_msat"], json!(100_000));
+        assert_eq!(path[1]["cltv_out"], json!(18));
+        // The deprecated trio is left in place, not removed.
+        assert_eq!(path[0]["next_node_id"], json!("02bb"));
+    }
+
+    #[test]
+    fn v2606_hops_are_left_alone() {
+        // A v26.06 hop already carries the new fields; values that
+        // disagree with the trio prove the shim did not touch them.
+        let mut route = json!({
+            "amount_msat": 100_000,
+            "final_cltv": 18,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/1",
+                "next_node_id": "02bb",
+                "amount_msat": 101_500,
+                "delay": 60,
+                "node_id_out": "02ff",
+                "amount_in_msat": 1,
+                "amount_out_msat": 2,
+                "cltv_in": 3,
+                "cltv_out": 4,
+            }],
+        });
+        let before = route.clone();
+        complete_hop_fields(&mut route);
+        assert_eq!(route, before);
+    }
+
+    #[test]
+    fn single_hop_takes_the_route_level_out_values() {
+        let mut route = json!({
+            "amount_msat": 100_000,
+            "final_cltv": 18,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/1",
+                "next_node_id": "02bb",
+                "amount_msat": 100_500,
+                "delay": 58,
+            }],
+        });
+        complete_hop_fields(&mut route);
+        let hop = &route["path"][0];
+        assert_eq!(hop["node_id_out"], json!("02bb"));
+        assert_eq!(hop["amount_in_msat"], json!(100_500));
+        assert_eq!(hop["amount_out_msat"], json!(100_000));
+        assert_eq!(hop["cltv_in"], json!(58));
+        assert_eq!(hop["cltv_out"], json!(18));
     }
 }
