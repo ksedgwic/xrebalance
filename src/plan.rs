@@ -144,7 +144,7 @@ fn part_within_length(n_hops: usize) -> bool {
     n_hops <= MAX_SAFE_HOPS
 }
 
-/// Complete the per-hop fields a pre-v26.06 getroutes leaves out.
+/// Normalize a route's hops to the v26.06 field set.
 ///
 /// CLN v26.06 gave each hop explicit in/out fields (node_id_out,
 /// amount_in_msat / amount_out_msat, cltv_in / cltv_out) and
@@ -152,34 +152,54 @@ fn part_within_length(n_hops: usize) -> bool {
 /// all a stock v26.04 hop carries.  The plugin reads the new names
 /// only, so without this every v26.04 request would die at the
 /// final-hop check with a misleading "does not end at the split
-/// node".  The derivation is an identity, not a guess: the old
-/// amount_msat and delay ARE the hop's in-amount and in-cltv, the
-/// next hop's in-values are this hop's out-values, and the final
-/// hop's out-values are the route's delivered amount_msat and
-/// final_cltv (both required in the v26.04 schema).  Dead code on
-/// v26.06+, whose hops already carry the new fields.
-fn complete_hop_fields(route: &mut Value) {
+/// node".  When the new fields are missing they are derived from
+/// the trio -- an identity, not a guess: the old amount_msat and
+/// delay ARE the hop's in-amount and in-cltv, the next hop's
+/// in-values are this hop's out-values, and the final hop's
+/// out-values are the route's delivered amount_msat and final_cltv
+/// (both required in the v26.04 schema).
+///
+/// The trio is then dropped from every hop, whatever the server
+/// version: nothing here reads it, the v26.06 schema slates it for
+/// removal in v27.06, and the final hop's next_node_id would
+/// otherwise carry the split node id into responses after
+/// node_id_out is rewritten to us.  Callers see one hop shape on
+/// every CLN.
+fn normalize_hops(route: &mut Value) {
     let Some(path) = route["path"].as_array() else {
         return;
     };
-    if path.iter().all(|hop| hop.get("node_id_out").is_some()) {
-        return;
-    }
-    let mut outs: Vec<(Value, Value)> = path
-        .iter()
-        .skip(1)
-        .map(|hop| (hop["amount_msat"].clone(), hop["delay"].clone()))
-        .collect();
-    outs.push((route["amount_msat"].clone(), route["final_cltv"].clone()));
+    let legacy = path.iter().any(|hop| hop.get("node_id_out").is_none());
+    // Each hop's out-values are the next hop's in-values; the last
+    // hop's are the route's own delivered amount and final cltv.
+    let mut outs: Vec<(Value, Value)> = if legacy {
+        let mut outs: Vec<_> = path
+            .iter()
+            .skip(1)
+            .map(|hop| (hop["amount_msat"].clone(), hop["delay"].clone()))
+            .collect();
+        outs.push((route["amount_msat"].clone(), route["final_cltv"].clone()));
+        outs
+    } else {
+        Vec::new()
+    };
     let Some(path) = route["path"].as_array_mut() else {
         return;
     };
-    for (hop, (amount_out, cltv_out)) in path.iter_mut().zip(outs) {
-        hop["node_id_out"] = hop["next_node_id"].clone();
-        hop["amount_in_msat"] = hop["amount_msat"].clone();
-        hop["cltv_in"] = hop["delay"].clone();
-        hop["amount_out_msat"] = amount_out;
-        hop["cltv_out"] = cltv_out;
+    for (i, hop) in path.iter_mut().enumerate() {
+        if legacy {
+            let (amount_out, cltv_out) = std::mem::take(&mut outs[i]);
+            hop["node_id_out"] = hop["next_node_id"].clone();
+            hop["amount_in_msat"] = hop["amount_msat"].clone();
+            hop["cltv_in"] = hop["delay"].clone();
+            hop["amount_out_msat"] = amount_out;
+            hop["cltv_out"] = cltv_out;
+        }
+        if let Some(fields) = hop.as_object_mut() {
+            for key in ["next_node_id", "amount_msat", "delay"] {
+                fields.remove(key);
+            }
+        }
     }
 }
 
@@ -745,7 +765,7 @@ async fn plan_in_layer(
     let mut pruned_rate_ppm: Vec<u64> = Vec::new();
     let mut pruned_rate_msat: u64 = 0;
     for mut route in solved_routes {
-        complete_hop_fields(&mut route);
+        normalize_hops(&mut route);
         let path = route["path"]
             .as_array_mut()
             .ok_or_else(|| anyhow!("getroutes: route without path"))?;
@@ -852,7 +872,7 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_hop_fields, fee_ppm, part_within_length, part_within_rate};
+    use super::{fee_ppm, normalize_hops, part_within_length, part_within_rate};
     use serde_json::json;
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
@@ -930,10 +950,16 @@ mod tests {
         })
     }
 
+    fn has_trio(hop: &serde_json::Value) -> bool {
+        ["next_node_id", "amount_msat", "delay"]
+            .iter()
+            .any(|k| hop.get(k).is_some())
+    }
+
     #[test]
     fn v2604_hops_gain_the_in_out_fields() {
         let mut route = v2604_route();
-        complete_hop_fields(&mut route);
+        normalize_hops(&mut route);
         let path = route["path"].as_array().unwrap();
         // Hop 0: in = its own trio, out = hop 1's in-values.
         assert_eq!(path[0]["node_id_out"], json!("02bb"));
@@ -947,14 +973,40 @@ mod tests {
         assert_eq!(path[1]["cltv_in"], json!(40));
         assert_eq!(path[1]["amount_out_msat"], json!(100_000));
         assert_eq!(path[1]["cltv_out"], json!(18));
-        // The deprecated trio is left in place, not removed.
-        assert_eq!(path[0]["next_node_id"], json!("02bb"));
+        // The trio is gone from both hops.
+        assert!(!has_trio(&path[0]));
+        assert!(!has_trio(&path[1]));
+        // The route-level fields are not touched.
+        assert_eq!(route["amount_msat"], json!(100_000));
+        assert_eq!(route["final_cltv"], json!(18));
     }
 
+    // v26.06 under allow-deprecated-apis=false: new fields only.
     #[test]
-    fn v2606_hops_are_left_alone() {
-        // A v26.06 hop already carries the new fields; values that
-        // disagree with the trio prove the shim did not touch them.
+    fn v2606_hops_without_the_trio_are_left_alone() {
+        let mut route = json!({
+            "amount_msat": 100_000,
+            "final_cltv": 18,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/1",
+                "node_id_in": "02aa",
+                "node_id_out": "02bb",
+                "amount_in_msat": 101_500,
+                "amount_out_msat": 100_000,
+                "cltv_in": 58,
+                "cltv_out": 18,
+            }],
+        });
+        let before = route.clone();
+        normalize_hops(&mut route);
+        assert_eq!(route, before);
+    }
+
+    // v26.06 with deprecated fields still emitted (or a v26.04
+    // backport build): the new fields win and the trio is dropped.
+    // Values that disagree with the trio prove nothing was derived.
+    #[test]
+    fn v2606_hops_keep_their_fields_and_lose_the_trio() {
         let mut route = json!({
             "amount_msat": 100_000,
             "final_cltv": 18,
@@ -970,9 +1022,14 @@ mod tests {
                 "cltv_out": 4,
             }],
         });
-        let before = route.clone();
-        complete_hop_fields(&mut route);
-        assert_eq!(route, before);
+        normalize_hops(&mut route);
+        let hop = &route["path"][0];
+        assert_eq!(hop["node_id_out"], json!("02ff"));
+        assert_eq!(hop["amount_in_msat"], json!(1));
+        assert_eq!(hop["amount_out_msat"], json!(2));
+        assert_eq!(hop["cltv_in"], json!(3));
+        assert_eq!(hop["cltv_out"], json!(4));
+        assert!(!has_trio(hop));
     }
 
     #[test]
@@ -987,12 +1044,13 @@ mod tests {
                 "delay": 58,
             }],
         });
-        complete_hop_fields(&mut route);
+        normalize_hops(&mut route);
         let hop = &route["path"][0];
         assert_eq!(hop["node_id_out"], json!("02bb"));
         assert_eq!(hop["amount_in_msat"], json!(100_500));
         assert_eq!(hop["amount_out_msat"], json!(100_000));
         assert_eq!(hop["cltv_in"], json!(58));
         assert_eq!(hop["cltv_out"], json!(18));
+        assert!(!has_trio(hop));
     }
 }
