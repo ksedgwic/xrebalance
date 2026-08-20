@@ -20,7 +20,7 @@ def pytest_configure(config):
     if shutil.which("lightningd") is None:
         pytest.exit(
             "no lightningd on PATH; set LIGHTNINGD=/path/to/lightningd "
-            "or extend PATH (v26.06+ required)", returncode=1)
+            "or extend PATH (v26.04+ required)", returncode=1)
 
 
 @pytest.fixture

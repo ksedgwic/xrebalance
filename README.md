@@ -10,7 +10,9 @@ inbound side terminates it, reachable only through copies of the
 chosen destination channels.  Any route from the one to the other
 is, on the wire, a circle back to the local node.  The adaptation
 is expressed entirely through the public askrene layer API — no
-askrene changes.  Runs on stock `lightningd`, v26.04 or later.
+askrene changes.  Runs on stock `lightningd`, v26.04 or later: the
+askrene calls it makes have existed since v24.11 (`maxparts` since
+v25.09), but only v26.04 and later have been tested.
 
 ## Quick start
 
@@ -227,7 +229,7 @@ over options no plugin claims.
 
 Integration tests drive the real plugin binary against regtest
 nodes via [pyln-testing]; nothing is mocked.  `lightningd`
-(v26.06+) and `bitcoind` must be on PATH:
+(v26.04+) and `bitcoind` must be on PATH:
 
     cargo build
     cd tests
