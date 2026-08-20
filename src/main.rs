@@ -587,7 +587,12 @@ async fn xrebalance(
         // Single-shot compatibility: the old response, exactly.
         return Ok(rounds.pop().expect("round 1 always executes"));
     }
-    log::debug!("req {req}: finished after {round} round(s): {stop_reason}");
+    // rounds.len(), not the loop counter: the counter has already
+    // advanced for the round a top-of-loop exit never ran.
+    log::debug!(
+        "req {req}: finished after {} round(s): {stop_reason}",
+        rounds.len()
+    );
     let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
     let mut response = serde_json::json!({
         "status": "executed",
