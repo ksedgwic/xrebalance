@@ -25,72 +25,68 @@ most 300 ppm in fees:
         amount_msat=1000000000 \
         maxfee_ppm=300
 
-xrebalance decides the split across the sources, replanning as
-failures teach it, until the amount moves or it can prove it
-cannot.  The response summarizes what was delivered and what it
-cost — and, when nothing moved, where the attempt came nearest to
-landing.  Add `dryrun=true` to see the identical plan without
-moving funds.
+xrebalance decides how to split the amount across the sources and
+replans after failures until the amount moves or no route remains.
+The response reports what was delivered and what it cost — and,
+when nothing moved, the failed part that came closest.  Add
+`dryrun=true` to see the same plan without moving funds.
 
 To build and load the plugin, see [Installation](#installation).
 
 ## Why xrebalance
 
 xrebalance is a low-level rebalance executor, in the spirit of
-xpay: it is meant to be driven by a high-level rebalancer that owns
-the *strategy* — which channels to drain, which to fill, how much,
-at what price, when — while xrebalance owns the *tactics*: routing,
-splitting into parts, claiming, retrying, and learning from what
-each attempt taught.
+xpay: a high-level rebalancer decides what to move — which channels
+to drain, which to fill, how much, at what price, when — and
+xrebalance carries it out: routing, splitting into parts, claiming,
+retrying, and using what each attempt showed.
 
 - **Strict fees.**  `maxfee_ppm` (or `maxfee_msat`) is enforced at
   the askrene quote and again post-route; no per-part slippage.
 - **Batch rebalancing.**  A request considers all its sources and
-  destinations at once — one min-cost-flow solve, free to split the
-  amount across every pairing; per-channel caps, drawn down across
-  the request, keep any single channel from over-balancing.
-- **Learns the network.**  Part outcomes feed a persistent askrene
-  layer and a short-lived override store; retries route better
-  than first attempts, within a request and across requests.
-- **Partial success is the semantic.**  `amount_msat` is a ceiling;
-  every settled part is banked liquidity; zero delivered is a
-  result, not an error.
-- **Tenacious.**  Up to `maxrounds` plan-execute rounds replan the
-  still-unmoved remainder; non-dryrun requests serialize, and the
-  RPC blocks through the rounds — which is what paces a driver.
+  destinations together in one min-cost-flow solve, which may split
+  the amount across any pairing; per-channel caps, drawn down across
+  the request, bound how much any one channel gives or receives.
+- **Learns from outcomes.**  Part outcomes feed a persistent askrene
+  layer and a short-lived override store, so later plans — within a
+  request and across requests — use what earlier attempts found.
+- **Partial delivery is normal.**  `amount_msat` is a ceiling; every
+  settled part is liquidity moved; zero delivered is a result, not
+  an error.
+- **Multiple rounds.**  Up to `maxrounds` plan-execute rounds replan
+  whatever has not yet moved; non-dryrun requests run one at a time,
+  and the RPC returns when the rounds end, which paces a driver.
 - **Independent parts.**  Each part has its own preimage and
-  payment_hash — never an MPP set.  A shared hash would let a node
-  routing two parts claim the second the moment the first settles;
-  per-part preimages close that window.
+  payment_hash, not an MPP set.  This allows immediate independent
+  settlement without waiting for all parts.
 - **A fragment floor.**  No part delivers less than
-  `xrebalance-min-part-msat` — a guard against plans fragmenting
-  into a spray of tiny, inefficient transfers.
-- **Dryrun fidelity.**  A dryrun runs the identical planner; its
-  result is what execution would have pursued.
+  `xrebalance-min-part-msat`, so plans do not fragment into many
+  tiny transfers.
+- **Dryrun.**  A dryrun runs the same planner as execution and
+  returns the plan execution would have used.
 - **Per-part notifications.**  Each part's resolution is broadcast
-  as an `xrebalance_part` notification — the feedback a high-level
-  rebalancer needs to keep accurate books without polling.
+  as an `xrebalance_part` notification, so a high-level rebalancer
+  can track per-channel results without polling.
 
 ### What xrebalance handles
 
-| when a request sees …                                                                                                      | xrebalance …                                                                                                                                                                                      |
-| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| a part settle                                                                                                              | records every hop's proven liquidity in the persistent layer — success history that later plans, and later requests, build on                                                                     |
-| a hop report insufficient liquidity                                                                                        | records the bound at the blocking hop — and the proven liquidity of every hop the part cleared on the way there — then replans the remainder                                                      |
-| a failure expose stale gossip — it carries the outgoing channel's current fees/CLTV                                        | overrides the stale values so the next plan prices the hop correctly; a policy that "refreshes" to the same values is not fresher, and escalates to exclusion                                     |
-| a forwarder report the next channel gone (`unknown_next_peer`) while gossip still advertises it                            | temporarily excludes the channel                                                                                                                                                                  |
-| a peer charge a positive inbound fee — a surcharge the sender cannot price, so the hop fails `fee_insufficient` every time | temporarily excludes the surcharging incoming channel                                                                                                                                             |
-| a `fee_insufficient` with its channel_update blanked (some forwarders zero it for privacy)                                 | cannot tell stale gossip from an inbound fee, so temporarily excludes both candidate channels — a failure must teach something, or the next plan repeats it, while over-excluding heals over time |
-| a hop return a node-level error (`temporary_node_failure`, …)                                                              | temporarily disables the node — excluding one channel would just re-route through the same node's other channels                                                                                  |
-| the returning HTLC offer less than the part delivered                                                                      | declines to settle it — releasing the preimage against a short HTLC would let the last-hop peer dishonestly claim the full amount upstream                                                        |
-| no usable route at the asked amount (getroutes 205)                                                                        | descends a ladder — 3/4, 1/2, 1/4, 1/8 of the amount — and plans the first amount the network can carry; a ladder run dry ends the request                                                        |
-| routes only over the fee budget (getroutes 206)                                                                            | stops rather than descending: base fees weigh more at smaller amounts, so cheaper routes do not appear further down                                                                               |
+| when a request sees …                                                                                                      | xrebalance …                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| a part settle                                                                                                              | records every hop's proven liquidity in the persistent layer — success history that later plans, and later requests, build on                                           |
+| a hop report insufficient liquidity                                                                                        | records the bound at the blocking hop — and the proven liquidity of every hop the part cleared on the way there — then replans the remainder                            |
+| a failure expose stale gossip — it carries the outgoing channel's current fees/CLTV                                        | overrides the stale values so the next plan prices the hop correctly; if the "refreshed" values equal what gossip already said, the channel is excluded instead         |
+| a forwarder report the next channel gone (`unknown_next_peer`) while gossip still advertises it                            | temporarily excludes the channel                                                                                                                                        |
+| a peer charge a positive inbound fee — a surcharge the sender cannot price, so the hop fails `fee_insufficient` every time | temporarily excludes the surcharging incoming channel                                                                                                                   |
+| a `fee_insufficient` with its channel_update blanked (some forwarders zero it for privacy)                                 | cannot tell stale gossip from an inbound fee, so temporarily excludes both candidate channels — otherwise the next plan would repeat the failure; the exclusions expire |
+| a hop return a node-level error (`temporary_node_failure`, …)                                                              | temporarily disables the node — excluding one channel would just re-route through the same node's other channels                                                        |
+| the returning HTLC offer less than the part delivered                                                                      | declines to settle it — releasing the preimage against a short HTLC would let the last-hop peer dishonestly claim the full amount upstream                              |
+| no usable route at the asked amount (getroutes 205)                                                                        | descends a ladder — 3/4, 1/2, 1/4, 1/8 of the amount — and plans the first amount the network can carry; a ladder run dry ends the request                              |
+| routes only over the fee budget (getroutes 206)                                                                            | stops rather than descending: base fees weigh more at smaller amounts, so cheaper routes do not appear further down                                                     |
 
-All of this self-heals: exclusions and node disables expire after
+All of this expires: exclusions and node disables after
 `xrebalance-override-age`, learned liquidity after
-`xrebalance-constraint-age` — as the network heals, its channels
-and nodes come automatically back into the plans.  Nothing is
-written off forever.
+`xrebalance-constraint-age`, so channels and nodes return to the
+plans as conditions change.
 
 ## Interface
 
@@ -114,30 +110,29 @@ The effective per-channel bound is always the **smaller** of the cap
 and the channel's live liquidity; a cap of 0 excludes the channel
 from this request.  A source's cap bounds what crosses the channel —
 delivered amount plus downstream fees — and the solver honors it to
-its routing granularity (about 0.1% of the amount), so treat caps as
-guardrails rather than exact accounting bounds.  Programs composing
+its routing granularity (about 0.1% of the amount), so caps are
+approximate limits, not exact accounting bounds.  Programs composing
 JSON (CLBOSS) should prefer the object form; the string forms are
 for humans at a CLI.
 
 `amount_msat` remains the request-wide ceiling.  The planner clamps
 it to what the channels can carry: the smaller of the summed source
 bounds — less the fee budget, since fees ride the source channels on
-top of the delivered amount — and the summed destination bounds.  A
-convenient corollary: `amount_msat` larger than a source can carry
-means "drain it", rather than planning nothing.
+top of the delivered amount — and the summed destination bounds.  In
+particular, an `amount_msat` larger than a source can carry drains
+the source rather than planning nothing.
 
 askrene plans for payments, where delivering less than the asked
 amount is failure, so each solve is all-or-nothing.  A rebalance
-has no such floor — whatever moves is banked — so when no route
+has no such floor — whatever moves is kept — so when no route
 exists at the clamped amount (one thin corridor is enough, since
 a clamp at the destination bound requires saturating every
 destination exactly), the planner **descends a ladder** — retrying
 the solve at 3/4, 1/2, 1/4, then 1/8 of the amount — and plans
-the first amount the network can actually carry.  This is the
-plan-time face of "partial delivery is the norm".  The amount planning
+the first amount the network can carry.  The amount planning
 settled on (clamp, then ladder) is reported as
-`effective_amount_msat`; dryruns run the identical planner, so a
-dryrun's result is what execution would have pursued.
+`effective_amount_msat`; dryruns run the same planner, so a
+dryrun's result is the plan execution would have used.
 
 Fee budgets under the ladder: a `maxfee_ppm` budget re-derives at
 each rung, so the *rate* you set holds at any size.  An absolute
@@ -152,11 +147,11 @@ do not appear further down.
 
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.
-The security reasons appear above — preimage replay under "Why
-xrebalance", short-HTLC claims under "What xrebalance handles" —
-and a further consequence is that intermediates cannot even
-correlate the parts.  Returning parts are claimed via
-the `htlc_accepted` hook — the plugin's only hook.
+Besides letting each part settle on its own, this means a node
+routing two parts cannot use the first part's preimage to claim
+the second, and intermediates cannot correlate the parts.  (The
+short-HTLC check is in the table above.)  Returning parts are
+claimed via the `htlc_accepted` hook — the plugin's only hook.
 
 One `xrebalance_part` notification is broadcast per part reaching a
 terminal state, carrying the part's own payment_hash, its
@@ -168,13 +163,13 @@ books without polling.
 The response leads with the outcome: request totals plus a
 `summary` block — round and part counts, delivered and fee totals,
 and, when nothing moved, a `closest_miss` naming the failed part
-that came nearest to landing.  `verbose=true` adds the per-round
+that came closest to succeeding.  `verbose=true` adds the per-round
 detail: each round's parts with their payment_hashes (the durable
-handles) and failure geometry.  Either way the response is a
+identifiers) and failure details.  Either way the response is a
 snapshot bounded by the window — `part_wait` seconds (0 = return
 immediately), defaulting to the `xrebalance-part-wait` option —
-and parts still pending detach and keep settling; their
-notifications fire when they land.
+and parts still pending continue on their own; their notifications
+arrive when they resolve.
 
 ## Configuration
 
