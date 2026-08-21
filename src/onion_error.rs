@@ -86,6 +86,18 @@ pub fn classify_fee_insufficient(
     let Some(cu) = update else {
         return FeeFault::Unattributed;
     };
+    // Floor division deliberately matches fee enforcement: BOLT 7's
+    // fee formula is integer division, and CLN's forwarder check
+    // computes it with the same floored helper askrene uses, so a
+    // route paying the floored fee is never short.  (An earlier
+    // "+1msat/hop rounding cushion" diagnosis of 0x100c from
+    // 0/1ppm hubs predated the discovery of positive inbound fees,
+    // which produce the same symptom and are what the
+    // alloc >= required branch attributes.)  Do not add a cushion
+    // here or to sendpay hop amounts: it would silently pay small
+    // inbound fees instead of routing around them, and mask the
+    // signal this comparison keys on.
+    //
     // The parser bounds proportional fees at 100%, so this cannot
     // wrap for any Lightning-plausible amount.
     let required = u64::from(cu.fee_base_msat)
