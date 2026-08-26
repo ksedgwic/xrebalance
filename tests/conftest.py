@@ -33,3 +33,13 @@ def xrebalance_plugin():
 @pytest.fixture
 def part_subscriber():
     return str(SUBSCRIBER)
+
+
+@pytest.fixture
+def plugin_opts(xrebalance_plugin, part_subscriber):
+    """Options for the node hosting the plugin.  The regtest asks are
+    100_000 msat, below the fragment floor's default, so the floor is
+    lowered here to keep planning intact; test_min_part_floor sets
+    its own values."""
+    return {'plugin': [xrebalance_plugin, part_subscriber],
+            'xrebalance-min-part-msat': 10_000}

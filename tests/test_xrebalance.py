@@ -13,11 +13,10 @@ from pyln.client import RpcError
 from pyln.testing.utils import only_one, wait_for
 
 
-def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
-                         part_subscriber):
+def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -145,8 +144,7 @@ def test_xrebalance_flow(node_factory, bitcoind, xrebalance_plugin,
     assert stats['layer']['depth_max'] >= 1, stats
 
 
-def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
-                          part_subscriber):
+def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     """A network hop without the liquidity the plan assumes.
 
     askrene knows a network channel's capacity but not its balance
@@ -159,7 +157,7 @@ def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -212,8 +210,7 @@ def test_failure_feedback(node_factory, bitcoind, xrebalance_plugin,
     assert res['routes'] != [], res
 
 
-def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
-                     part_subscriber):
+def test_scid_limits(node_factory, bitcoind, plugin_opts):
     """Per-scid caps: both syntax forms, the fee-aware amount clamp,
     caps binding inside one multi-source solve, and the zero-cap
     result.  Fee budget below: maxfee_msat=5000, so a binding source
@@ -221,7 +218,7 @@ def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -329,8 +326,7 @@ def test_scid_limits(node_factory, bitcoind, xrebalance_plugin,
         == before + 55000)
 
 
-def test_min_part_floor(node_factory, bitcoind, xrebalance_plugin,
-                        part_subscriber):
+def test_min_part_floor(node_factory, bitcoind, plugin_opts):
     """The fragment floor rides each destination mirror's
     htlc_minimum_msat, so askrene itself never plans a part
     delivering less: sub-floor flows are dropped in its refine
@@ -341,7 +337,7 @@ def test_min_part_floor(node_factory, bitcoind, xrebalance_plugin,
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -373,8 +369,7 @@ def test_min_part_floor(node_factory, bitcoind, xrebalance_plugin,
     assert stats['options']['min_part_msat'] == 60_000, stats
 
 
-def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
-                   part_subscriber):
+def test_maxrounds(node_factory, bitcoind, plugin_opts):
     """The tenacious loop: an ask beyond what the channels can carry
     runs multiple rounds -- round 1 moves what fits, a later round
     replans the remainder, finds the sources and destination
@@ -385,7 +380,7 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -410,15 +405,14 @@ def test_maxrounds(node_factory, bitcoind, xrebalance_plugin,
     l1.daemon.wait_for_log(r"req tenacious: finished after \d+ round")
 
 
-def test_limits_across_rounds(node_factory, bitcoind, xrebalance_plugin,
-                              part_subscriber):
+def test_limits_across_rounds(node_factory, bitcoind, plugin_opts):
     """A per-target limit is one pot across the rounds: an ask far
     beyond a source's cap stops once the cap is exhausted, instead
     of drawing up to the cap afresh every round.
     """
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[{'plugin': [xrebalance_plugin, part_subscriber]}, {}, {}])
+        opts=[plugin_opts, {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(

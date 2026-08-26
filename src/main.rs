@@ -99,7 +99,7 @@ const OPT_PART_WAIT: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
 /// 0 disables the floor.
 const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     name: "xrebalance-min-part-msat",
-    default: 10_000,
+    default: 1_000_000,
     description: "minimum msat a planned part must deliver (fragment \
                   floor; 0 disables)",
     deprecated: false,

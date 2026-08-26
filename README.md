@@ -203,7 +203,7 @@ setconfig`, so tuning never requires a plugin restart.
 | `xrebalance-constraint-age=<seconds>` | 21600   | expiry of learned constraints                                                                                           |
 | `xrebalance-override-age=<seconds>`   | 3600    | expiry of learned overrides: policy refreshes, node disables, channel exclusions                                        |
 | `xrebalance-part-wait=<seconds>`      | 30      | default snapshot window                                                                                                 |
-| `xrebalance-min-part-msat=<msat>`     | 10000   | fragment floor: the least a part may deliver                                                                            |
+| `xrebalance-min-part-msat=<msat>`     | 1000000 | fragment floor: the least a part may deliver                                                                            |
 | `xrebalance-max-rounds=<n>`           | 50      | plan-execute rounds per request (`maxrounds` overrides; ignored on dryrun)                                              |
 | `xrebalance-final-cltv=<blocks>`      | 40      | final-hop cltv delta for return legs: slack for the removal handshake before lightningd's fulfilled-HTLC close deadline |
 
