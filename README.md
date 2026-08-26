@@ -171,6 +171,28 @@ immediately), defaulting to the `xrebalance-part-wait` option —
 and parts still pending continue on their own; their notifications
 arrive when they resolve.
 
+## Checking on it
+
+    lightning-cli xrebalance-stats
+
+reports the plugin version, the effective option values, and what
+the plugin has learned.  The `layer` block summarizes the persistent
+askrene layer: how many constraints it holds, split into minimums
+(liquidity a part proved) and maximums (bounds a failure found), how
+many channel directions they cover, how deep they stack per
+direction, and the timestamps of the oldest and newest.  The
+`overrides` block counts the short-lived learned overrides — policy
+refreshes, node disables, channel exclusions; `claims` counts parts
+still in flight; `coalescer_entries` counts the cache that
+suppresses redundant layer writes.
+
+Run it after a request, or when a plan looks wrong, to see what the
+layer has learned and how old that knowledge is.  `channel_updates`,
+`disabled_nodes`, and `created_channels` in the layer block belong
+to the per-request layers and should read zero in the persistent
+one.  The full layer contents are available from `lightning-cli
+askrene-listlayers layer=xrebalance`.
+
 ## Configuration
 
 All options are dynamic — adjustable at runtime via `lightning-cli
@@ -239,7 +261,7 @@ inspiration.
 
 MIT
 
-[askrene]: https://docs.corelightning.org/reference/lightning-getroutes
+[askrene]: https://docs.corelightning.org/reference/getroutes
 [plugins-install]: https://github.com/lightningd/plugins#installation
 [rustup]: https://rustup.rs
 [pyln-testing]: https://pypi.org/project/pyln-testing/
