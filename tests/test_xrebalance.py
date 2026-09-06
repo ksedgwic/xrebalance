@@ -2,21 +2,31 @@
 
     l1 -> l2 -> l3 public; l3 -> l1 unannounced (the fill channel).
 
-Covers: dryrun planning with translated final hops, the zero-budget
-zero-delivered result, real execution settled via the claimer, the
-authoritative xrebalance_part notifications (in-window and detached
-background watcher), and success feedback landing in the persistent
-layer.
+Covers: dryrun planning with translated final hops, the exact fee
+(the network hops' charges, never our own first-hop policy), the
+zero-budget zero-delivered result, real execution settled via the
+claimer, the authoritative xrebalance_part notifications (in-window
+and detached background watcher), and success feedback landing in
+the persistent layer.
 """
 import pytest
 from pyln.client import RpcError
 from pyln.testing.utils import only_one, wait_for
 
 
+def hop_fee(base_msat, ppm, amount_msat):
+    """What a policy charges to forward amount_msat (BOLT 7, floored
+    as CLN computes it)."""
+    return base_msat + amount_msat * ppm // 1_000_000
+
+
 def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
+    # l1's own fee policy is set apart from the defaults the other
+    # nodes keep, so pricing it anywhere shows in the fee checks.
     l1, l2, l3 = node_factory.line_graph(
         3, wait_for_announce=True,
-        opts=[plugin_opts, {}, {}])
+        opts=[{**plugin_opts, 'fee-base': 2500, 'fee-per-satoshi': 500},
+              {}, {}])
     scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
 
     src = only_one(
@@ -26,6 +36,11 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     # its policy.
     wait_for(lambda: 'remote' in only_one(
         l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    fill_update = only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels'])['updates']['remote']
+    chan23 = only_one([c for c in l1.rpc.listchannels(
+        source=l2.info['id'])['channels']
+        if c['destination'] == l3.info['id']])
 
     # DRYRUN: plan only.
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
@@ -33,12 +48,25 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
                             dryrun=True)
     assert res['status'] == 'planned', res
     assert res['delivered_msat'] == 100000, res
-    assert res['fee_msat'] <= 5000, res
+    # The fee is what the two network hops charge: l3 on l3 -> l1 for
+    # the delivered amount, l2 on l2 -> l3 for what it forwards
+    # (delivered plus l3's fee).  Our own policy on the first hop is
+    # paid to no one and must not appear (auto.sourcefree in the
+    # getroutes layers).
+    fee31 = hop_fee(fill_update['fee_base_msat'],
+                    fill_update['fee_proportional_millionths'], 100000)
+    fee23 = hop_fee(chan23['base_fee_millisatoshi'],
+                    chan23['fee_per_millionth'], 100000 + fee31)
+    expected_fee = fee23 + fee31
+    assert res['fee_msat'] == expected_fee, res
 
     route = only_one(res['routes'])
     path = route['path']
-    # Leaves via the named source channel...
+    # Leaves via the named source channel, carrying no fee on it:
+    # what we send is what l2 receives...
     assert path[0]['short_channel_id_dir'].startswith(src), res
+    assert path[0]['amount_in_msat'] == path[0]['amount_out_msat'], res
+    assert path[0]['amount_in_msat'] == 100000 + expected_fee, res
     # ...and comes home over the REAL fill channel, translated back
     # from the mirror by the plugin.
     fill_dir = 0 if l3.info['id'] < l1.info['id'] else 1
@@ -84,7 +112,9 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert res['delivered_msat'] == 100000, res
     assert part['first_hop'].startswith(src), res
     assert part['return_hop'] == f"{scid_fill}/{fill_dir}", res
-    assert res['fee_msat'] <= 5000, res
+    assert res['fee_msat'] == expected_fee, res
+    assert part['fee_msat'] == expected_fee, res
+    assert part['sent_msat'] == 100000 + expected_fee, res
 
     # Our side of the fill channel grew by exactly the delivered
     # amount: the self-payment settled via the htlc_accepted claimer.
@@ -103,9 +133,6 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     # first and return hops are ours and excluded) must now carry an
     # unconstrained record in the persistent xrebalance layer at (at
     # least) the amount that crossed it.
-    chan23 = only_one([c for c in l1.rpc.listchannels(
-        source=l2.info['id'])['channels']
-        if c['destination'] == l3.info['id']])
     scidd23 = f"{chan23['short_channel_id']}/{chan23['direction']}"
     xlayer = only_one(l1.rpc.askrene_listlayers('xrebalance')['layers'])
     cons = [c for c in xlayer['constraints']
