@@ -666,8 +666,13 @@ async fn plan_in_layer(
             "source": self_id,
             "destination": FAKE_US_IN,
             "amount_msat": rung,
-            // Split layer LAST: its masks must override auto.localchans.
-            "layers": ["auto.localchans", PERSISTENT_LAYER, split],
+            // auto.sourcefree zeroes fee and delay on channels leaving
+            // the source.  We are the source and pay no one on the
+            // first hop; without it askrene prices our own fee into
+            // every route, and fee_msat, the budget and source ranking
+            // carry it.  Split layer LAST: its masks must override
+            // auto.localchans.
+            "layers": ["auto.localchans", "auto.sourcefree", PERSISTENT_LAYER, split],
             "maxfee_msat": rung_maxfee,
             "final_cltv": state.final_cltv.load(Ordering::Relaxed),
         });
