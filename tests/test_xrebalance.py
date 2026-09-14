@@ -115,6 +115,9 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert res['fee_msat'] == expected_fee, res
     assert part['fee_msat'] == expected_fee, res
     assert part['sent_msat'] == 100000 + expected_fee, res
+    # askrene's success estimate for the route, carried from the plan
+    # so the outcome can be joined to it.
+    assert 0 <= part['probability_ppm'] <= 1_000_000, res
 
     # Our side of the fill channel grew by exactly the delivered
     # amount: the self-payment settled via the htlc_accepted claimer.
@@ -128,6 +131,14 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert l1.daemon.is_in_log(
         r"subscriber got xrebalance_part:.*%s"
         % only_one(res['parts'])['payment_hash'])
+    # The plan summary and the part's outcome line both carry the
+    # estimate, so the two can be joined from the log alone.
+    assert l1.daemon.is_in_log(
+        r"planned 1 part\(s\), success probability "
+        r"[0-9.]+/[0-9.]+/[0-9.]+% min/median/max per part, "
+        r"expected delivery [0-9.]+% of the planned amount")
+    assert l1.daemon.is_in_log(
+        r"part +1/ +1 complete: .*, probability +[0-9.]+%")
 
     # Success feedback: the one NETWORK hop of the route (l2 -> l3;
     # first and return hops are ours and excluded) must now carry an
@@ -210,6 +221,9 @@ def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     assert res['pending_msat'] == 0, res
 
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
+    # A failed part's line carries the estimate too.
+    assert l1.daemon.is_in_log(
+        r"part +1/ +1 failed.*, probability +[0-9.]+%")
 
     # Failure feedback: the erring direction (l2 -> l3) now carries a
     # constrained record in the persistent layer.

@@ -36,7 +36,7 @@ use crate::onion_error::{
     classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate, FeeFault,
 };
 use crate::plan::{fee_ppm, PlanResult, PERSISTENT_LAYER};
-use crate::{eng, Claim, State, XRebalanceParams, TOPIC_PART};
+use crate::{eng, percent, Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
 const WAITSENDPAY_TIMEOUT: i32 = 200;
@@ -152,6 +152,9 @@ struct Part {
     planned_sent_msat: u64,
     /// The route's hops, for writing outcome feedback.
     hops: Vec<PartHop>,
+    /// askrene's success estimate for the route at plan time, kept
+    /// so the outcome can be joined to it.
+    probability_ppm: Option<u64>,
     status: &'static str,
     detail: Option<String>,
     /// Failure geometry, set at terminal state: how many hops of
@@ -196,6 +199,7 @@ impl Part {
             "delivered_msat": self.delivered_msat(),
             "sent_msat": self.planned_sent_msat,
             "fee_msat": self.fee_msat(),
+            "probability_ppm": self.probability_ppm,
             "hops_short": self.hops_short,
             "failcode": self.failcode,
             "erring_scidd": self.erring_scidd,
@@ -565,6 +569,10 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
 /// one summary log line (debug; the per-hop detail is at trace).
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
     let req = label.as_deref().unwrap_or("?");
+    let prob = match part.probability_ppm {
+        Some(p) => format!(", probability {:>5}%", percent(p)),
+        None => String::new(),
+    };
     if part.status == "complete" {
         let fee = part.fee_msat();
         let ppm = if part.planned_msat > 0 {
@@ -574,7 +582,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         };
         log::debug!(
             "req {req}: part {:>2}/{:>2} complete: delivered {:>13} msat \
-             fee {:>9} msat ({:>6} ppm)",
+             fee {:>9} msat ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.delivered_msat()),
@@ -597,7 +605,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         let planned_fee = part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
             "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
-             {:>13} msat ({:>6} ppm)",
+             {:>13} msat ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
@@ -820,6 +828,7 @@ pub async fn execute(
             planned_msat,
             planned_sent_msat: first["amount_in_msat"].as_u64().unwrap_or(0),
             hops,
+            probability_ppm: route["probability_ppm"].as_u64(),
             status: "pending",
             detail: None,
             hops_short: None,
@@ -1037,6 +1046,7 @@ mod tests {
             planned_msat: 0,
             planned_sent_msat: 0,
             hops,
+            probability_ppm: None,
             status: "failed",
             detail: None,
             hops_short: None,

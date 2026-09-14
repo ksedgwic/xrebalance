@@ -273,6 +273,12 @@ pub fn eng(n: u64) -> String {
     out
 }
 
+/// Render a parts-per-million value as a percentage with one
+/// decimal for log lines: 900_000 -> "90.0".  JSON keeps the ppm.
+pub fn percent(ppm: u64) -> String {
+    format!("{:.1}", ppm as f64 / 10_000.0)
+}
+
 fn main() -> Result<(), Error> {
     // The framework's logger drops records below CLN_PLUGIN_LOG
     // (default info) inside the process, so our per-request detail
@@ -927,7 +933,9 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_down, eng, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict};
+    use super::{
+        draw_down, eng, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict,
+    };
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1022,6 +1030,15 @@ mod tests {
         assert_eq!(eng(1000), "1_000");
         assert_eq!(eng(10005958), "10_005_958");
         assert_eq!(eng(u64::MAX), "18_446_744_073_709_551_615");
+    }
+
+    #[test]
+    fn percent_renders_ppm() {
+        assert_eq!(percent(0), "0.0");
+        assert_eq!(percent(5), "0.0");
+        assert_eq!(percent(12_345), "1.2");
+        assert_eq!(percent(900_000), "90.0");
+        assert_eq!(percent(1_000_000), "100.0");
     }
 
     fn hash() -> String {

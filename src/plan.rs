@@ -769,6 +769,13 @@ async fn plan_in_layer(
     // rates (sorted for min/median/max) and foregone delivery.
     let mut pruned_rate_ppm: Vec<u64> = Vec::new();
     let mut pruned_rate_msat: u64 = 0;
+    // askrene's success estimate per planned part, with the part's
+    // delivered amount, summarized after the loop.  The estimate
+    // assumes no other part shares a channel with it.  The response's
+    // own solve-level figure is the chance that every part lands,
+    // a multi-part payment's event; parts here settle independently
+    // and partial delivery is normal, so it is not reported.
+    let mut planned_prob: Vec<(u64, u64)> = Vec::new();
     for mut route in solved_routes {
         normalize_hops(&mut route);
         let path = route["path"]
@@ -824,9 +831,42 @@ async fn plan_in_layer(
             pruned_rate_msat = pruned_rate_msat.saturating_add(route_delivered);
             continue;
         }
+        if let Some(prob) = route["probability_ppm"].as_u64() {
+            log::trace!(
+                "req {}: planned part: {} msat delivered ({:>6} ppm), \
+                 success probability {:>5}%",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(route_delivered),
+                crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
+                crate::percent(prob),
+            );
+            planned_prob.push((prob, route_delivered));
+        }
         sent += route_sent;
         delivered += route_delivered;
         routes.push(route);
+    }
+    if !planned_prob.is_empty() {
+        // Amount-weighted mean of the per-part estimates: the share
+        // of the planned amount expected to deliver this round.
+        let weighted: u128 = planned_prob
+            .iter()
+            .map(|(prob, msat)| u128::from(*prob) * u128::from(*msat))
+            .sum();
+        let total: u128 = planned_prob.iter().map(|(_, msat)| u128::from(*msat)).sum();
+        let expected_ppm = (weighted / total.max(1)) as u64;
+        let mut ppm: Vec<u64> = planned_prob.iter().map(|(prob, _)| *prob).collect();
+        ppm.sort_unstable();
+        log::debug!(
+            "req {}: planned {} part(s), success probability {}/{}/{}% \
+             min/median/max per part, expected delivery {}% of the planned amount",
+            params.label.as_deref().unwrap_or("?"),
+            ppm.len(),
+            crate::percent(ppm[0]),
+            crate::percent(ppm[(ppm.len() - 1) / 2]),
+            crate::percent(ppm[ppm.len() - 1]),
+            crate::percent(expected_ppm),
+        );
     }
     if !pruned_rate_ppm.is_empty() {
         pruned_rate_ppm.sort_unstable();
