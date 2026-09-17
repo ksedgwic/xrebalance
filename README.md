@@ -62,6 +62,9 @@ retrying, and using what each attempt showed.
 - **A fragment floor.**  No part delivers less than
   `xrebalance-min-part-msat`, so plans do not fragment into many
   tiny transfers.
+- **A probability floor.**  Optionally, a part whose success
+  estimate from askrene is below
+  `xrebalance-min-probability-percent` is not sent.  Off by default.
 - **Dryrun.**  A dryrun runs the same planner as execution and
   returns the plan execution would have used.
 - **Per-part notifications.**  Each part's resolution is broadcast
@@ -93,7 +96,7 @@ plans as conditions change.
     xrebalance sources=[src,...] destinations=[dst,...]
                amount_msat=N (maxfee_ppm=N | maxfee_msat=N)
                [label=...] [dryrun=true] [maxparts=N] [part_wait=N]
-               [maxrounds=N] [verbose=true]
+               [maxrounds=N] [min_probability_percent=N] [verbose=true]
 
 Each `src`/`dst` element names one of the local node's channels,
 optionally with a cap on how much this request moves through it —
@@ -145,6 +148,20 @@ too-expensive result (getroutes 206) never descends: base fees
 weigh proportionally more at smaller amounts, so cheaper routes
 do not appear further down.
 
+askrene reports a success estimate with every route
+(`probability_ppm`): the product over the hops of a linear estimate
+between each channel's known minimum and maximum liquidity.  With a
+**probability floor** set — `min_probability_percent`, a whole
+percentage defaulting to the `xrebalance-min-probability-percent`
+option — a planned part whose estimate is below the floor is dropped
+and not sent.  The unit is percent, not ppm, so the value does not
+read as a fee rate.  Nothing is recorded for a dropped part, so the
+check keeps no state; when every part of a plan is dropped the round
+sends nothing and the request ends as when no route is found.  The
+floor is off by default (0).  Each part's estimate appears in the
+log and in its notification, so a floor can be chosen from a node's
+own outcomes.
+
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.
 Besides letting each part settle on its own, this means a node
@@ -156,9 +173,9 @@ claimed via the `htlc_accepted` hook — the plugin's only hook.
 One `xrebalance_part` notification is broadcast per part reaching a
 terminal state, carrying the part's own payment_hash, its
 part_index, first-hop scid, real return-hop scid, delivered and fee
-amounts, status, and the caller's `label` — the request-level
-correlator, and enough for callers to keep accurate per-channel
-books without polling.
+amounts, success estimate (`probability_ppm`), status, and the
+caller's `label` — the request-level correlator, and enough for
+callers to keep accurate per-channel books without polling.
 
 The response leads with the outcome: request totals plus a
 `summary` block — round and part counts, delivered and fee totals,
@@ -198,14 +215,15 @@ askrene-listlayers layer=xrebalance`.
 All options are dynamic — adjustable at runtime via `lightning-cli
 setconfig`, so tuning never requires a plugin restart.
 
-| option                                | default | meaning                                                                                                                 |
-| ------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `xrebalance-constraint-age=<seconds>` | 21600   | expiry of learned constraints                                                                                           |
-| `xrebalance-override-age=<seconds>`   | 3600    | expiry of learned overrides: policy refreshes, node disables, channel exclusions                                        |
-| `xrebalance-part-wait=<seconds>`      | 30      | default snapshot window                                                                                                 |
-| `xrebalance-min-part-msat=<msat>`     | 1000000 | fragment floor: the least a part may deliver                                                                            |
-| `xrebalance-max-rounds=<n>`           | 50      | plan-execute rounds per request (`maxrounds` overrides; ignored on dryrun)                                              |
-| `xrebalance-final-cltv=<blocks>`      | 40      | final-hop cltv delta for return legs: slack for the removal handshake before lightningd's fulfilled-HTLC close deadline |
+| option                                         | default | meaning                                                                                                                      |
+| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `xrebalance-constraint-age=<seconds>`          | 21600   | expiry of learned constraints                                                                                                |
+| `xrebalance-override-age=<seconds>`            | 3600    | expiry of learned overrides: policy refreshes, node disables, channel exclusions                                             |
+| `xrebalance-part-wait=<seconds>`               | 30      | default snapshot window                                                                                                      |
+| `xrebalance-min-part-msat=<msat>`              | 1000000 | fragment floor: the least a part may deliver                                                                                 |
+| `xrebalance-min-probability-percent=<percent>` | 0       | probability floor: the least success estimate, in percent, a part may have (`min_probability_percent` overrides; 0 disables) |
+| `xrebalance-max-rounds=<n>`                    | 50      | plan-execute rounds per request (`maxrounds` overrides; ignored on dryrun)                                                   |
+| `xrebalance-final-cltv=<blocks>`               | 40      | final-hop cltv delta for return legs: slack for the removal handshake before lightningd's fulfilled-HTLC close deadline      |
 
 ## Installation
 

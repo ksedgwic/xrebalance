@@ -410,6 +410,61 @@ def test_min_part_floor(node_factory, bitcoind, plugin_opts):
     assert stats['options']['min_part_msat'] == 60_000, stats
 
 
+def test_min_probability_floor(node_factory, bitcoind, plugin_opts):
+    """The probability floor drops planned parts whose success
+    estimate from askrene is below it; a plan left with no parts
+    reports why and moves nothing.  Off by default (0), dynamic via
+    setconfig, and overridable per request.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[plugin_opts, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    ask = dict(sources=[src], destinations=[scid_fill],
+               amount_msat=100_000, maxfee_msat=5_000, dryrun=True)
+
+    # Off by default: the part is planned, and its estimate is high
+    # but short of certain (one network hop with unknown liquidity).
+    res = l1.rpc.xrebalance(**ask)
+    estimate = only_one(res['routes'])['probability_ppm']
+    assert 990_000 <= estimate < 1_000_000, res
+    stats = l1.rpc.call('xrebalance-stats')
+    assert stats['options']['min_probability_percent'] == 0, stats
+
+    # A floor above the estimate drops the part: nothing is planned,
+    # and the detail says why.
+    l1.rpc.setconfig('xrebalance-min-probability-percent', 100)
+    res = l1.rpc.xrebalance(**ask)
+    assert res['routes'] == [], res
+    assert res['delivered_msat'] == 0, res
+    assert 'under the probability floor' in res['detail'], res
+    assert l1.daemon.is_in_log(
+        r"pruned 1 part\(s\) under the probability floor")
+
+    # The per-request value overrides the option, in both directions.
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=0)
+    assert only_one(res['routes'])['probability_ppm'] == estimate, res
+    l1.rpc.setconfig('xrebalance-min-probability-percent', 0)
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=100)
+    assert res['routes'] == [], res
+
+    # A floor just under the estimate keeps the part.
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=99)
+    assert only_one(res['routes'])['probability_ppm'] == estimate, res
+
+    # Out-of-range values are refused, option and parameter alike.
+    with pytest.raises(RpcError, match='at most 100'):
+        l1.rpc.setconfig('xrebalance-min-probability-percent', 101)
+    with pytest.raises(RpcError, match='at most 100'):
+        l1.rpc.xrebalance(**ask, min_probability_percent=101)
+
+
 def test_maxrounds(node_factory, bitcoind, plugin_opts):
     """The tenacious loop: an ask beyond what the channels can carry
     runs multiple rounds -- round 1 moves what fits, a later round
