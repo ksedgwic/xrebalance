@@ -1016,6 +1016,7 @@ mod tests {
             constraint_age: Arc::new(AtomicU64::new(6 * 60 * 60)),
             part_wait_secs: Arc::new(AtomicU64::new(0)),
             min_part_msat: Arc::new(AtomicU64::new(0)),
+            min_probability_percent: Arc::new(AtomicU64::new(0)),
             max_rounds: Arc::new(AtomicU64::new(1)),
             final_cltv: Arc::new(AtomicU64::new(40)),
             request_gate: Arc::new(tokio::sync::Mutex::new(())),

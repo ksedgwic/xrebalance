@@ -144,6 +144,38 @@ fn part_within_length(n_hops: usize) -> bool {
     n_hops <= MAX_SAFE_HOPS
 }
 
+/// Whether one part's success estimate meets the probability floor.
+/// A floor of 0 admits every part; a route without an estimate is
+/// never dropped for lacking one.
+fn part_within_probability(probability_ppm: Option<u64>, floor_ppm: u64) -> bool {
+    probability_ppm.is_none_or(|prob| prob >= floor_ppm)
+}
+
+/// The detail string for a plan whose every part was pruned: names
+/// the one reason when there is only one, the count per reason
+/// otherwise.
+fn all_pruned_detail(n_solved: usize, long: usize, over_rate: usize, under_prob: usize) -> String {
+    if over_rate == n_solved {
+        return format!("all {n_solved} planned parts exceeded the fee rate cap");
+    }
+    if under_prob == n_solved {
+        return format!("all {n_solved} planned parts were under the probability floor");
+    }
+    let reasons: Vec<String> = [
+        (long, format!("over {MAX_SAFE_HOPS} hops")),
+        (over_rate, "over the fee rate cap".to_owned()),
+        (under_prob, "under the probability floor".to_owned()),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, reason)| format!("{count} {reason}"))
+    .collect();
+    format!(
+        "all {n_solved} planned parts pruned: {}",
+        reasons.join(", ")
+    )
+}
+
 /// Normalize a route's hops to the v26.06 field set.
 ///
 /// CLN v26.06 gave each hop explicit in/out fields (node_id_out,
@@ -776,6 +808,15 @@ async fn plan_in_layer(
     // a multi-part payment's event; parts here settle independently
     // and partial delivery is normal, so it is not reported.
     let mut planned_prob: Vec<(u64, u64)> = Vec::new();
+    // Parts dropped under the probability floor, summarized after
+    // the loop like the fee-rate prune.
+    // The floor is set in whole percent; askrene's estimates are ppm.
+    let min_probability_ppm = params
+        .min_probability_percent
+        .unwrap_or_else(|| state.min_probability_percent.load(Ordering::Relaxed))
+        * 10_000;
+    let mut pruned_prob_ppm: Vec<u64> = Vec::new();
+    let mut pruned_prob_msat: u64 = 0;
     for mut route in solved_routes {
         normalize_hops(&mut route);
         let path = route["path"]
@@ -831,7 +872,25 @@ async fn plan_in_layer(
             pruned_rate_msat = pruned_rate_msat.saturating_add(route_delivered);
             continue;
         }
-        if let Some(prob) = route["probability_ppm"].as_u64() {
+        // A part below the floor is not sent.  Nothing is written to
+        // the layer for it, so the solver may propose the same route
+        // again next round; it is dropped again, and a round left
+        // with no parts ends the request as when no route is found.
+        let probability_ppm = route["probability_ppm"].as_u64();
+        if !part_within_probability(probability_ppm, min_probability_ppm) {
+            log::trace!(
+                "req {}: pruning part under the probability floor: {} msat \
+                 delivered, success probability {:>5}% (floor {}%)",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(route_delivered),
+                crate::percent(probability_ppm.unwrap_or(0)),
+                crate::percent(min_probability_ppm),
+            );
+            pruned_prob_ppm.push(probability_ppm.unwrap_or(0));
+            pruned_prob_msat = pruned_prob_msat.saturating_add(route_delivered);
+            continue;
+        }
+        if let Some(prob) = probability_ppm {
             log::trace!(
                 "req {}: planned part: {} msat delivered ({:>6} ppm), \
                  success probability {:>5}%",
@@ -882,6 +941,20 @@ async fn plan_in_layer(
             crate::eng(fee_ppm(rung_maxfee, rung_amount).unwrap_or(0)),
         );
     }
+    if !pruned_prob_ppm.is_empty() {
+        pruned_prob_ppm.sort_unstable();
+        log::debug!(
+            "req {}: pruned {} part(s) under the probability floor ({} msat \
+             foregone): {}/{}/{}% min/median/max vs {}% floor",
+            params.label.as_deref().unwrap_or("?"),
+            pruned_prob_ppm.len(),
+            crate::eng(pruned_prob_msat),
+            crate::percent(pruned_prob_ppm[0]),
+            crate::percent(pruned_prob_ppm[(pruned_prob_ppm.len() - 1) / 2]),
+            crate::percent(pruned_prob_ppm[pruned_prob_ppm.len() - 1]),
+            crate::percent(min_probability_ppm),
+        );
+    }
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
     // per part above, and re-checked here post-route.
@@ -891,15 +964,12 @@ async fn plan_in_layer(
         ));
     }
     let detail = if routes.is_empty() && n_solved > 0 {
-        Some(if pruned_long == 0 {
-            format!("all {n_solved} planned parts exceeded the fee rate cap")
-        } else {
-            format!(
-                "all {n_solved} planned parts pruned: {pruned_long} over \
-                 {MAX_SAFE_HOPS} hops, {} over the fee rate cap",
-                n_solved - pruned_long
-            )
-        })
+        Some(all_pruned_detail(
+            n_solved,
+            pruned_long,
+            pruned_rate_ppm.len(),
+            pruned_prob_ppm.len(),
+        ))
     } else {
         None
     };
@@ -917,7 +987,10 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{fee_ppm, normalize_hops, part_within_length, part_within_rate};
+    use super::{
+        all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
+        part_within_rate,
+    };
     use serde_json::json;
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
@@ -946,6 +1019,55 @@ mod tests {
     #[test]
     fn zero_fee_is_within() {
         assert!(part_within_rate(0, 100_000, 0, 1_000_000));
+    }
+
+    // The default floor of 0 disables the prune: no estimate is
+    // below it, a zero estimate included.
+    #[test]
+    fn zero_floor_admits_every_part() {
+        assert!(part_within_probability(Some(0), 0));
+        assert!(part_within_probability(Some(1_000_000), 0));
+    }
+
+    #[test]
+    fn at_the_probability_floor_is_within() {
+        assert!(part_within_probability(Some(500_000), 500_000));
+    }
+
+    #[test]
+    fn under_the_probability_floor_is_pruned() {
+        assert!(!part_within_probability(Some(499_999), 500_000));
+    }
+
+    #[test]
+    fn a_route_without_an_estimate_is_kept() {
+        assert!(part_within_probability(None, 1_000_000));
+    }
+
+    #[test]
+    fn all_pruned_detail_names_a_single_reason() {
+        assert_eq!(
+            all_pruned_detail(3, 0, 3, 0),
+            "all 3 planned parts exceeded the fee rate cap"
+        );
+        assert_eq!(
+            all_pruned_detail(2, 0, 0, 2),
+            "all 2 planned parts were under the probability floor"
+        );
+    }
+
+    #[test]
+    fn all_pruned_detail_counts_mixed_reasons() {
+        assert_eq!(
+            all_pruned_detail(6, 1, 2, 3),
+            "all 6 planned parts pruned: 1 over 20 hops, 2 over the fee \
+             rate cap, 3 under the probability floor"
+        );
+        assert_eq!(
+            all_pruned_detail(4, 0, 1, 3),
+            "all 4 planned parts pruned: 1 over the fee rate cap, 3 under \
+             the probability floor"
+        );
     }
 
     #[test]
