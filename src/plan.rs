@@ -151,6 +151,52 @@ fn part_within_probability(probability_ppm: Option<u64>, floor_ppm: u64) -> bool
     probability_ppm.is_none_or(|prob| prob >= floor_ppm)
 }
 
+/// A route's path as the sequence of its channel directions, the
+/// identity a later plan's route is matched on against this
+/// request's failures.
+pub fn route_path(route: &Value) -> Vec<String> {
+    route["path"]
+        .as_array()
+        .map(|hops| {
+            hops.iter()
+                .map(|hop| {
+                    hop["short_channel_id_dir"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether every planned route retries a path this request already
+/// failed for liquidity, delivering no less than that failure's
+/// amount less one fragment.  A liquidity failure at X teaches the
+/// solver that the channel carries less than X, which askrene stores
+/// as at most X - 1, so the next solve can plan the same path one
+/// msat lower, and would again after that failure; the step is real
+/// only when it exceeds a fragment, the smallest amount a plan deals
+/// in.  A plan with a route on an untried path, or on a tried path
+/// more than a fragment below the failure, is worth sending.
+pub fn retries_liquidity_failures(
+    routes: &[Value],
+    failed: &HashMap<Vec<String>, u64>,
+    fragment_msat: u64,
+) -> bool {
+    !routes.is_empty()
+        && routes.iter().all(|route| {
+            let delivered = route["path"]
+                .as_array()
+                .and_then(|hops| hops.last())
+                .and_then(|hop| hop["amount_out_msat"].as_u64())
+                .unwrap_or(0);
+            failed
+                .get(&route_path(route))
+                .is_some_and(|&failed_msat| delivered >= failed_msat.saturating_sub(fragment_msat))
+        })
+}
+
 /// The detail string for a plan whose every part was pruned: names
 /// the one reason when there is only one, the count per reason
 /// otherwise.
@@ -989,9 +1035,10 @@ async fn plan_in_layer(
 mod tests {
     use super::{
         all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
-        part_within_rate,
+        part_within_rate, retries_liquidity_failures, route_path,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
     #[test]
@@ -1068,6 +1115,94 @@ mod tests {
             "all 4 planned parts pruned: 1 over the fee rate cap, 3 under \
              the probability floor"
         );
+    }
+
+    fn route(hops: &[&str], delivered_msat: u64) -> Value {
+        let path: Vec<Value> = hops
+            .iter()
+            .map(|scidd| json!({"short_channel_id_dir": scidd, "amount_out_msat": delivered_msat}))
+            .collect();
+        json!({"path": path})
+    }
+
+    fn failed(entries: &[(&[&str], u64)]) -> HashMap<Vec<String>, u64> {
+        entries
+            .iter()
+            .map(|(hops, msat)| (hops.iter().map(|s| s.to_string()).collect(), *msat))
+            .collect()
+    }
+
+    const A: &[&str] = &["1x1x1/0", "2x2x2/1", "3x3x3/0"];
+    const B: &[&str] = &["1x1x1/0", "4x4x4/1", "3x3x3/0"];
+
+    #[test]
+    fn route_path_is_the_hop_sequence() {
+        assert_eq!(route_path(&route(A, 5)), A.to_vec());
+        assert!(route_path(&json!({})).is_empty());
+    }
+
+    // The msat shave: the same path one msat under the failed
+    // amount is a retry; so is the failed amount itself.
+    #[test]
+    fn a_msat_under_the_failure_is_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_999_999)],
+            &tried,
+            1
+        ));
+        assert!(retries_liquidity_failures(
+            &[route(A, 200_000_000)],
+            &tried,
+            1
+        ));
+    }
+
+    // More than a fragment below the failure is a real step.
+    #[test]
+    fn more_than_a_fragment_below_the_failure_is_not_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_000_000)],
+            &tried,
+            1_000_000
+        ));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 198_999_999)],
+            &tried,
+            1_000_000
+        ));
+    }
+
+    // One untried path in the plan makes the round worth sending.
+    #[test]
+    fn an_untried_path_is_not_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(!retries_liquidity_failures(
+            &[route(B, 199_999_999)],
+            &tried,
+            1
+        ));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 199_999_999), route(B, 1)],
+            &tried,
+            1
+        ));
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_999_999), route(B, 49_999_999)],
+            &failed(&[(A, 200_000_000), (B, 50_000_000)]),
+            1
+        ));
+    }
+
+    #[test]
+    fn nothing_planned_or_nothing_failed_is_not_a_retry() {
+        assert!(!retries_liquidity_failures(&[], &failed(&[(A, 1)]), 1));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 1)],
+            &HashMap::new(),
+            1
+        ));
     }
 
     #[test]

@@ -697,6 +697,10 @@ pub struct ExecOutcome {
     /// absolute fee budget.
     pub source_committed_msat: HashMap<String, u64>,
     pub dest_committed_msat: HashMap<String, u64>,
+    /// The parts that failed for liquidity, by path, with the
+    /// amount each was to deliver: what the request loop (main.rs)
+    /// checks the next plan against before sending it.
+    pub liquidity_failed: HashMap<Vec<String>, u64>,
 }
 
 /// The channel half of a "scid/dir" string.
@@ -719,11 +723,27 @@ fn committed_by_target(parts: &[Part]) -> (HashMap<String, u64>, HashMap<String,
     (by_source, by_dest)
 }
 
+/// The parts that failed with temporary_channel_failure, by path,
+/// each with the amount it was to deliver.
+fn liquidity_failed_by_path(parts: &[Part]) -> HashMap<Vec<String>, u64> {
+    parts
+        .iter()
+        .filter(|p| p.status == "failed" && p.failcode == Some(WIRE_TEMPORARY_CHANNEL_FAILURE))
+        .map(|p| {
+            (
+                p.hops.iter().map(|h| h.scidd.clone()).collect(),
+                p.planned_msat,
+            )
+        })
+        .collect()
+}
+
 /// Bundle the terminal render with the cross-round totals.
 fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> ExecOutcome {
     let pending: Vec<&Part> = parts.iter().filter(|p| p.status == "pending").collect();
     let (source_committed_msat, dest_committed_msat) = committed_by_target(parts);
     ExecOutcome {
+        liquidity_failed: liquidity_failed_by_path(parts),
         delivered_msat: parts.iter().map(Part::delivered_msat).sum(),
         fee_msat: parts.iter().map(Part::fee_msat).sum(),
         pending_msat: pending.iter().map(|p| p.planned_msat).sum(),

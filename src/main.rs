@@ -523,6 +523,11 @@ async fn xrebalance(
     // whole request, not each round.
     let mut source_committed: HashMap<String, u64> = HashMap::new();
     let mut dest_committed: HashMap<String, u64> = HashMap::new();
+    // The paths this request has failed for liquidity, each with
+    // the amount that failed, so a later plan that only retries
+    // them is not sent (see retries_liquidity_failures).
+    let mut liquidity_failed: HashMap<Vec<String>, u64> = HashMap::new();
+    let fragment_msat = state.min_part_msat.load(Ordering::Relaxed).max(1);
     let mut round: u64 = 0;
     let stop_reason: String;
     loop {
@@ -532,16 +537,13 @@ async fn xrebalance(
         // double-spending its liquidity on a retry.
         let committed = delivered_total.saturating_add(pending_total);
         let remaining = parsed.amount_msat.saturating_sub(committed);
-        if round > 1 {
-            let floor = state.min_part_msat.load(Ordering::Relaxed).max(1);
-            if remaining < floor {
-                stop_reason = if remaining == 0 {
-                    "amount fully committed".into()
-                } else {
-                    format!("remaining {}msat below the fragment floor", eng(remaining))
-                };
-                break;
-            }
+        if round > 1 && remaining < fragment_msat {
+            stop_reason = if remaining == 0 {
+                "amount fully committed".into()
+            } else {
+                format!("remaining {}msat below the fragment floor", eng(remaining))
+            };
+            break;
         }
         let mut round_params = parsed.clone();
         round_params.amount_msat = remaining;
@@ -575,6 +577,22 @@ async fn xrebalance(
                     .unwrap_or("planner returned no routes"),
             );
         }
+        // A liquidity failure at X is stored as "at most X - 1", so
+        // the next solve may plan the same path one msat lower,
+        // round after round; each failure is a feedback write, so
+        // the stall check below never sees it.  A plan that only
+        // retries failed paths within a fragment of their amounts
+        // ends the request unsent.
+        if round > 1
+            && plan::retries_liquidity_failures(&planned.routes, &liquidity_failed, fragment_msat)
+        {
+            stop_reason = format!(
+                "stalled: every planned part retries a route this request \
+                 already failed for liquidity, within {} msat of the amount",
+                eng(fragment_msat)
+            );
+            break;
+        }
         let outcome = match exec::execute(&_plugin, &round_params, &planned, started).await {
             Ok(o) => o,
             Err(e) if round > 1 => {
@@ -593,6 +611,7 @@ async fn xrebalance(
         for (scid, msat) in &outcome.dest_committed_msat {
             *dest_committed.entry(scid.clone()).or_default() += *msat;
         }
+        liquidity_failed.extend(outcome.liquidity_failed);
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
