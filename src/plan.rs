@@ -439,13 +439,22 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 /// forwarders as node disables, exclusions as 1msat constraints.
 /// Best-effort per entry -- a channel gone from gossip since we
 /// learned about it must not fail the plan, it just stops
-/// benefiting from the override.
-async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
+/// benefiting from the override.  One debug line per plan says
+/// what was written, and each entry askrene refused is logged with
+/// its error, so an override that fails to reach the solver is
+/// visible in the log.
+async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str, req: &str) {
     let snap = state
         .overrides
         .lock()
         .expect("overrides lock")
         .snapshot(now_secs());
+    let (n_policies, n_nodes, n_exclusions) = (
+        snap.policies.len(),
+        snap.disabled_nodes.len(),
+        snap.exclusions.len(),
+    );
+    let mut refused = 0usize;
     for (scidd, cu) in snap.policies {
         if let Err(e) = call(
             rpc,
@@ -463,7 +472,8 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override {scidd}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override {scidd} not written: {e}");
         }
     }
     for node in snap.disabled_nodes {
@@ -474,7 +484,8 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override disable {node}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override disable {node} not written: {e}");
         }
     }
     for scidd in snap.exclusions {
@@ -490,8 +501,15 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override exclusion {scidd}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override exclusion {scidd} not written: {e}");
         }
+    }
+    if n_policies + n_nodes + n_exclusions > 0 {
+        log::debug!(
+            "req {req}: overrides written to the request layer: {n_policies} policy, \
+             {n_nodes} node, {n_exclusions} exclusion ({refused} refused)"
+        );
     }
 }
 
@@ -556,7 +574,7 @@ async fn plan_in_layer(
     amount_msat: u64,
     maxfee_msat: u64,
 ) -> Result<PlanResult, Error> {
-    apply_overrides(rpc, state, split).await;
+    apply_overrides(rpc, state, split, params.label.as_deref().unwrap_or("?")).await;
 
     // Mirror each destination's (peer -> us) direction into us_in,
     // remembering fake scid/dir -> real scid/dir.
