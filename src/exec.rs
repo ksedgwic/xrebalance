@@ -59,6 +59,13 @@ const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
 /// override (overrides.rs).
 const WIRE_POLICY_CARRYING: [u64; 4] = [0x100b, 0x100d, 0x100e, 0x1014];
 
+/// BOLT 4 expiry_too_far (21): the forwarder refuses an HTLC whose
+/// expiry lies further ahead than its own locktime limit.  The
+/// limit is the forwarder's policy and is not gossiped, so the
+/// direction is excluded in the override store for one
+/// override-age; the next plan routes around it.
+const WIRE_EXPIRY_TOO_FAR: u64 = 0x15;
+
 /// BOLT 4 unknown_next_peer (PERM|10): the forwarder has no usable
 /// next channel -- closed but still gossiped, or the peer is
 /// offline.  The direction is excluded in the PERSISTENT layer
@@ -296,6 +303,11 @@ async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, 
 /// override for future request layers, or exclude the direction
 /// when the forwarder blanked the update (apply_policy_refresh).
 ///
+/// Locktime failures (expiry_too_far at hop N): the forwarder's
+/// limit, not gossiped; exclude the direction for an override-age
+/// (the hops before it forwarded, so they are informed
+/// unconstrained as for a liquidity failure).
+///
 /// Node-level failures: disable the forwarder for a while -- but
 /// never our own node, which in a circular rebalance is also the
 /// destination; disabling self would take every channel we have out
@@ -331,11 +343,13 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             let policy_carrying = WIRE_POLICY_CARRYING.contains(&failcode);
             let node_failure = failcode & NODE_BIT != 0;
             let dead_next = failcode == WIRE_UNKNOWN_NEXT_PEER;
+            let expiry_too_far = failcode == WIRE_EXPIRY_TOO_FAR;
             if failcode != WIRE_TEMPORARY_CHANNEL_FAILURE
                 && !fee_insufficient
                 && !policy_carrying
                 && !node_failure
                 && !dead_next
+                && !expiry_too_far
             {
                 return;
             }
@@ -390,6 +404,17 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 return;
             }
             let erring = &part.hops[erring_idx];
+            if expiry_too_far {
+                if !erring.ours {
+                    record_exclusion(state, &erring.scidd);
+                    log::debug!(
+                        "expiry_too_far at {}: the forwarder's locktime limit; \
+                         excluded",
+                        erring.scidd,
+                    );
+                }
+                return;
+            }
             if !erring.ours {
                 // A liquidity failure constrains at the amount that
                 // could not pass; a dead next-channel is excluded

@@ -7,6 +7,7 @@
 /// hex.  "UNKNOWN" for codes not in the table.
 pub fn failcode_name(failcode: u64) -> &'static str {
     match failcode {
+        0x15 => "EXPIRY_TOO_FAR",
         0x1007 => "TEMPORARY_CHANNEL_FAILURE",
         0x100b => "AMOUNT_BELOW_MINIMUM",
         0x100c => "FEE_INSUFFICIENT",
@@ -415,6 +416,7 @@ mod tests {
 
     #[test]
     fn failcode_names() {
+        assert_eq!(failcode_name(0x15), "EXPIRY_TOO_FAR");
         assert_eq!(failcode_name(0x100c), "FEE_INSUFFICIENT");
         assert_eq!(failcode_name(0x1014), "CHANNEL_DISABLED");
         assert_eq!(failcode_name(0xdead), "UNKNOWN");
