@@ -229,7 +229,8 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
         .to_owned();
     let _ = state.self_id.set(self_id.clone());
 
-    let chans = usable_channels(&mut rpc).await?;
+    let local = local_channels(&mut rpc).await?;
+    let chans = &local.usable;
     for spec in params.sources.iter().chain(&params.destinations) {
         let scid = &spec.scid;
         if !chans.contains_key(scid) {
@@ -345,7 +346,8 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
         state,
         &split,
         &self_id,
-        &chans,
+        chans,
+        &local.fence,
         params,
         amount_msat,
         maxfee_msat,
@@ -417,20 +419,33 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
     }
 }
 
-/// Channels we can use, keyed by scid: ours, CHANNELD_NORMAL.
-async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Error> {
+/// Our channels, as listpeerchannels reports them.
+struct Local {
+    /// Channels a request may name, keyed by scid: CHANNELD_NORMAL.
+    usable: HashMap<String, Chan>,
+    /// Every channel of ours with a short channel id, in any state,
+    /// as (scid, peer_id).  The fence in plan_in_layer covers them
+    /// all: a channel awaiting splice lock-in is not usable, but
+    /// askrene's auto.localchans still carries it, and unmasked the
+    /// solver may leave through it.
+    fence: Vec<(String, String)>,
+}
+
+async fn local_channels(rpc: &mut ClnRpc) -> Result<Local, Error> {
     let lpc = call(rpc, "listpeerchannels", json!({})).await?;
-    let mut out = HashMap::new();
+    let mut usable = HashMap::new();
+    let mut fence = Vec::new();
     for ch in lpc["channels"].as_array().into_iter().flatten() {
-        if ch["state"].as_str() != Some("CHANNELD_NORMAL") {
-            continue;
-        }
         let (Some(scid), Some(peer_id)) = (ch["short_channel_id"].as_str(), ch["peer_id"].as_str())
         else {
             continue;
         };
+        fence.push((scid.to_owned(), peer_id.to_owned()));
+        if ch["state"].as_str() != Some("CHANNELD_NORMAL") {
+            continue;
+        }
         let private = ch["private"].as_bool().unwrap_or(false);
-        out.insert(
+        usable.insert(
             scid.to_owned(),
             Chan {
                 peer_id: peer_id.to_owned(),
@@ -446,7 +461,7 @@ async fn usable_channels(rpc: &mut ClnRpc) -> Result<HashMap<String, Chan>, Erro
             },
         );
     }
-    Ok(out)
+    Ok(Local { usable, fence })
 }
 
 async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
@@ -474,6 +489,7 @@ async fn plan_in_layer(
     split: &str,
     self_id: &str,
     chans: &HashMap<String, Chan>,
+    fence: &[(String, String)],
     params: &XRebalanceParams,
     amount_msat: u64,
     maxfee_msat: u64,
@@ -570,25 +586,27 @@ async fn plan_in_layer(
     }
 
     // Mask: no flow may enter the real us (all inbound dirs off),
-    // and the drain side is pinned to the named sources.
+    // and the drain side is pinned to the named sources.  The fence
+    // takes every channel of ours whatever its state; sources are
+    // validated usable, so their entries are in `chans`.
     let src_caps: HashMap<&str, Option<u64>> = params
         .sources
         .iter()
         .map(|s| (s.scid.as_str(), s.max_msat))
         .collect();
-    for (scid, chan) in chans {
+    for (scid, peer_id) in fence {
         call(
             rpc,
             "askrene-update-channel",
             json!({
                 "layer": split,
                 "short_channel_id_dir":
-                    format!("{scid}/{}", dir(&chan.peer_id, self_id)),
+                    format!("{scid}/{}", dir(peer_id, self_id)),
                 "enabled": false,
             }),
         )
         .await?;
-        let out_scidd = format!("{scid}/{}", dir(self_id, &chan.peer_id));
+        let out_scidd = format!("{scid}/{}", dir(self_id, peer_id));
         match src_caps.get(scid.as_str()) {
             None => {
                 call(
@@ -613,7 +631,7 @@ async fn plan_in_layer(
             // The MCF quantizes flow into ~amount/1000 units and
             // may sit one unit past a knowledge bound, so a cap is
             // honored to routing granularity, not to the msat.
-            Some(Some(cap)) if *cap < chan.spendable_msat => {
+            Some(Some(cap)) if *cap < chans[scid].spendable_msat => {
                 call(
                     rpc,
                     "askrene-inform-channel",
