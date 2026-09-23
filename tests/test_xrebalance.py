@@ -469,3 +469,38 @@ def test_limits_across_rounds(node_factory, bitcoind, plugin_opts):
     # MCF quantizes in ~amount/1000 units per round).
     slop = 2_000_000_000 // 1000
     assert res['delivered_msat'] + res['fee_msat'] <= cap + slop, res
+
+
+def test_fence_covers_spliced_channel(node_factory, bitcoind, plugin_opts):
+    """A channel awaiting splice lock-in cannot be named in a request,
+    but askrene still knows it.  With a direct l1 -> l3 channel in that
+    state, the cheapest way to the fill channel's mirror is through it;
+    the plan must leave through the named source instead."""
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True, opts=[plugin_opts, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+    scid_direct, _ = l1.fundchannel(l3, announce_channel=True)
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        [c for c in l1.rpc.listpeerchannels(l3.info['id'])['channels']
+         if c['short_channel_id'] == scid_fill]).get('updates', {}))
+
+    def direct():
+        return only_one([c for c in l1.rpc.listpeerchannels(l3.info['id'])['channels']
+                         if c['short_channel_id'] == scid_direct])
+
+    # Splice into the direct channel and leave the splice unconfirmed.
+    l1.fundwallet(1_000_000)
+    l1.rpc.splicein(direct()['channel_id'], 200_000)
+    wait_for(lambda: direct()['state'] == 'CHANNELD_AWAITING_SPLICE')
+
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            dryrun=True)
+    assert res['status'] == 'planned', res
+    assert res['routes'] != [], res
+    for route in res['routes']:
+        first = route['path'][0]['short_channel_id_dir']
+        assert first.startswith(src), res
+        assert not first.startswith(scid_direct), res
