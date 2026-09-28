@@ -144,6 +144,84 @@ fn part_within_length(n_hops: usize) -> bool {
     n_hops <= MAX_SAFE_HOPS
 }
 
+/// Whether one part's success estimate meets the probability floor.
+/// A floor of 0 admits every part; a route without an estimate is
+/// never dropped for lacking one.
+fn part_within_probability(probability_ppm: Option<u64>, floor_ppm: u64) -> bool {
+    probability_ppm.is_none_or(|prob| prob >= floor_ppm)
+}
+
+/// A route's path as the sequence of its channel directions, the
+/// identity a later plan's route is matched on against this
+/// request's failures.
+pub fn route_path(route: &Value) -> Vec<String> {
+    route["path"]
+        .as_array()
+        .map(|hops| {
+            hops.iter()
+                .map(|hop| {
+                    hop["short_channel_id_dir"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether every planned route retries a path this request already
+/// failed for liquidity, delivering no less than that failure's
+/// amount less one fragment.  A liquidity failure at X teaches the
+/// solver that the channel carries less than X, which askrene stores
+/// as at most X - 1, so the next solve can plan the same path one
+/// msat lower, and would again after that failure; the step is real
+/// only when it exceeds a fragment, the smallest amount a plan deals
+/// in.  A plan with a route on an untried path, or on a tried path
+/// more than a fragment below the failure, is worth sending.
+pub fn retries_liquidity_failures(
+    routes: &[Value],
+    failed: &HashMap<Vec<String>, u64>,
+    fragment_msat: u64,
+) -> bool {
+    !routes.is_empty()
+        && routes.iter().all(|route| {
+            let delivered = route["path"]
+                .as_array()
+                .and_then(|hops| hops.last())
+                .and_then(|hop| hop["amount_out_msat"].as_u64())
+                .unwrap_or(0);
+            failed
+                .get(&route_path(route))
+                .is_some_and(|&failed_msat| delivered >= failed_msat.saturating_sub(fragment_msat))
+        })
+}
+
+/// The detail string for a plan whose every part was pruned: names
+/// the one reason when there is only one, the count per reason
+/// otherwise.
+fn all_pruned_detail(n_solved: usize, long: usize, over_rate: usize, under_prob: usize) -> String {
+    if over_rate == n_solved {
+        return format!("all {n_solved} planned parts exceeded the fee rate cap");
+    }
+    if under_prob == n_solved {
+        return format!("all {n_solved} planned parts were under the probability floor");
+    }
+    let reasons: Vec<String> = [
+        (long, format!("over {MAX_SAFE_HOPS} hops")),
+        (over_rate, "over the fee rate cap".to_owned()),
+        (under_prob, "under the probability floor".to_owned()),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, reason)| format!("{count} {reason}"))
+    .collect();
+    format!(
+        "all {n_solved} planned parts pruned: {}",
+        reasons.join(", ")
+    )
+}
+
 /// Normalize a route's hops to the v26.06 field set.
 ///
 /// CLN v26.06 gave each hop explicit in/out fields (node_id_out,
@@ -361,13 +439,22 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 /// forwarders as node disables, exclusions as 1msat constraints.
 /// Best-effort per entry -- a channel gone from gossip since we
 /// learned about it must not fail the plan, it just stops
-/// benefiting from the override.
-async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
+/// benefiting from the override.  One debug line per plan says
+/// what was written, and each entry askrene refused is logged with
+/// its error, so an override that fails to reach the solver is
+/// visible in the log.
+async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str, req: &str) {
     let snap = state
         .overrides
         .lock()
         .expect("overrides lock")
         .snapshot(now_secs());
+    let (n_policies, n_nodes, n_exclusions) = (
+        snap.policies.len(),
+        snap.disabled_nodes.len(),
+        snap.exclusions.len(),
+    );
+    let mut refused = 0usize;
     for (scidd, cu) in snap.policies {
         if let Err(e) = call(
             rpc,
@@ -385,7 +472,8 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override {scidd}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override {scidd} not written: {e}");
         }
     }
     for node in snap.disabled_nodes {
@@ -396,7 +484,8 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override disable {node}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override disable {node} not written: {e}");
         }
     }
     for scidd in snap.exclusions {
@@ -412,8 +501,15 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str) {
         )
         .await
         {
-            log::trace!("override exclusion {scidd}: {e}");
+            refused += 1;
+            log::debug!("req {req}: override exclusion {scidd} not written: {e}");
         }
+    }
+    if n_policies + n_nodes + n_exclusions > 0 {
+        log::debug!(
+            "req {req}: overrides written to the request layer: {n_policies} policy, \
+             {n_nodes} node, {n_exclusions} exclusion ({refused} refused)"
+        );
     }
 }
 
@@ -478,7 +574,7 @@ async fn plan_in_layer(
     amount_msat: u64,
     maxfee_msat: u64,
 ) -> Result<PlanResult, Error> {
-    apply_overrides(rpc, state, split).await;
+    apply_overrides(rpc, state, split, params.label.as_deref().unwrap_or("?")).await;
 
     // Mirror each destination's (peer -> us) direction into us_in,
     // remembering fake scid/dir -> real scid/dir.
@@ -769,6 +865,22 @@ async fn plan_in_layer(
     // rates (sorted for min/median/max) and foregone delivery.
     let mut pruned_rate_ppm: Vec<u64> = Vec::new();
     let mut pruned_rate_msat: u64 = 0;
+    // askrene's success estimate per planned part, with the part's
+    // delivered amount, summarized after the loop.  The estimate
+    // assumes no other part shares a channel with it.  The response's
+    // own solve-level figure is the chance that every part lands,
+    // a multi-part payment's event; parts here settle independently
+    // and partial delivery is normal, so it is not reported.
+    let mut planned_prob: Vec<(u64, u64)> = Vec::new();
+    // Parts dropped under the probability floor, summarized after
+    // the loop like the fee-rate prune.
+    // The floor is set in whole percent; askrene's estimates are ppm.
+    let min_probability_ppm = params
+        .min_probability_percent
+        .unwrap_or_else(|| state.min_probability_percent.load(Ordering::Relaxed))
+        * 10_000;
+    let mut pruned_prob_ppm: Vec<u64> = Vec::new();
+    let mut pruned_prob_msat: u64 = 0;
     for mut route in solved_routes {
         normalize_hops(&mut route);
         let path = route["path"]
@@ -824,9 +936,60 @@ async fn plan_in_layer(
             pruned_rate_msat = pruned_rate_msat.saturating_add(route_delivered);
             continue;
         }
+        // A part below the floor is not sent.  Nothing is written to
+        // the layer for it, so the solver may propose the same route
+        // again next round; it is dropped again, and a round left
+        // with no parts ends the request as when no route is found.
+        let probability_ppm = route["probability_ppm"].as_u64();
+        if !part_within_probability(probability_ppm, min_probability_ppm) {
+            log::trace!(
+                "req {}: pruning part under the probability floor: {} msat \
+                 delivered, success probability {:>5}% (floor {}%)",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(route_delivered),
+                crate::percent(probability_ppm.unwrap_or(0)),
+                crate::percent(min_probability_ppm),
+            );
+            pruned_prob_ppm.push(probability_ppm.unwrap_or(0));
+            pruned_prob_msat = pruned_prob_msat.saturating_add(route_delivered);
+            continue;
+        }
+        if let Some(prob) = probability_ppm {
+            log::trace!(
+                "req {}: planned part: {} msat delivered ({:>6} ppm), \
+                 success probability {:>5}%",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(route_delivered),
+                crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
+                crate::percent(prob),
+            );
+            planned_prob.push((prob, route_delivered));
+        }
         sent += route_sent;
         delivered += route_delivered;
         routes.push(route);
+    }
+    if !planned_prob.is_empty() {
+        // Amount-weighted mean of the per-part estimates: the share
+        // of the planned amount expected to deliver this round.
+        let weighted: u128 = planned_prob
+            .iter()
+            .map(|(prob, msat)| u128::from(*prob) * u128::from(*msat))
+            .sum();
+        let total: u128 = planned_prob.iter().map(|(_, msat)| u128::from(*msat)).sum();
+        let expected_ppm = (weighted / total.max(1)) as u64;
+        let mut ppm: Vec<u64> = planned_prob.iter().map(|(prob, _)| *prob).collect();
+        ppm.sort_unstable();
+        log::debug!(
+            "req {}: planned {} part(s), success probability {}/{}/{}% \
+             min/median/max per part, expected delivery {}% of the planned amount",
+            params.label.as_deref().unwrap_or("?"),
+            ppm.len(),
+            crate::percent(ppm[0]),
+            crate::percent(ppm[(ppm.len() - 1) / 2]),
+            crate::percent(ppm[ppm.len() - 1]),
+            crate::percent(expected_ppm),
+        );
     }
     if !pruned_rate_ppm.is_empty() {
         pruned_rate_ppm.sort_unstable();
@@ -842,6 +1005,20 @@ async fn plan_in_layer(
             crate::eng(fee_ppm(rung_maxfee, rung_amount).unwrap_or(0)),
         );
     }
+    if !pruned_prob_ppm.is_empty() {
+        pruned_prob_ppm.sort_unstable();
+        log::debug!(
+            "req {}: pruned {} part(s) under the probability floor ({} msat \
+             foregone): {}/{}/{}% min/median/max vs {}% floor",
+            params.label.as_deref().unwrap_or("?"),
+            pruned_prob_ppm.len(),
+            crate::eng(pruned_prob_msat),
+            crate::percent(pruned_prob_ppm[0]),
+            crate::percent(pruned_prob_ppm[(pruned_prob_ppm.len() - 1) / 2]),
+            crate::percent(pruned_prob_ppm[pruned_prob_ppm.len() - 1]),
+            crate::percent(min_probability_ppm),
+        );
+    }
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
     // per part above, and re-checked here post-route.
@@ -851,15 +1028,12 @@ async fn plan_in_layer(
         ));
     }
     let detail = if routes.is_empty() && n_solved > 0 {
-        Some(if pruned_long == 0 {
-            format!("all {n_solved} planned parts exceeded the fee rate cap")
-        } else {
-            format!(
-                "all {n_solved} planned parts pruned: {pruned_long} over \
-                 {MAX_SAFE_HOPS} hops, {} over the fee rate cap",
-                n_solved - pruned_long
-            )
-        })
+        Some(all_pruned_detail(
+            n_solved,
+            pruned_long,
+            pruned_rate_ppm.len(),
+            pruned_prob_ppm.len(),
+        ))
     } else {
         None
     };
@@ -877,8 +1051,12 @@ async fn plan_in_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{fee_ppm, normalize_hops, part_within_length, part_within_rate};
-    use serde_json::json;
+    use super::{
+        all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
+        part_within_rate, retries_liquidity_failures, route_path,
+    };
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
     #[test]
@@ -906,6 +1084,143 @@ mod tests {
     #[test]
     fn zero_fee_is_within() {
         assert!(part_within_rate(0, 100_000, 0, 1_000_000));
+    }
+
+    // The default floor of 0 disables the prune: no estimate is
+    // below it, a zero estimate included.
+    #[test]
+    fn zero_floor_admits_every_part() {
+        assert!(part_within_probability(Some(0), 0));
+        assert!(part_within_probability(Some(1_000_000), 0));
+    }
+
+    #[test]
+    fn at_the_probability_floor_is_within() {
+        assert!(part_within_probability(Some(500_000), 500_000));
+    }
+
+    #[test]
+    fn under_the_probability_floor_is_pruned() {
+        assert!(!part_within_probability(Some(499_999), 500_000));
+    }
+
+    #[test]
+    fn a_route_without_an_estimate_is_kept() {
+        assert!(part_within_probability(None, 1_000_000));
+    }
+
+    #[test]
+    fn all_pruned_detail_names_a_single_reason() {
+        assert_eq!(
+            all_pruned_detail(3, 0, 3, 0),
+            "all 3 planned parts exceeded the fee rate cap"
+        );
+        assert_eq!(
+            all_pruned_detail(2, 0, 0, 2),
+            "all 2 planned parts were under the probability floor"
+        );
+    }
+
+    #[test]
+    fn all_pruned_detail_counts_mixed_reasons() {
+        assert_eq!(
+            all_pruned_detail(6, 1, 2, 3),
+            "all 6 planned parts pruned: 1 over 20 hops, 2 over the fee \
+             rate cap, 3 under the probability floor"
+        );
+        assert_eq!(
+            all_pruned_detail(4, 0, 1, 3),
+            "all 4 planned parts pruned: 1 over the fee rate cap, 3 under \
+             the probability floor"
+        );
+    }
+
+    fn route(hops: &[&str], delivered_msat: u64) -> Value {
+        let path: Vec<Value> = hops
+            .iter()
+            .map(|scidd| json!({"short_channel_id_dir": scidd, "amount_out_msat": delivered_msat}))
+            .collect();
+        json!({"path": path})
+    }
+
+    fn failed(entries: &[(&[&str], u64)]) -> HashMap<Vec<String>, u64> {
+        entries
+            .iter()
+            .map(|(hops, msat)| (hops.iter().map(|s| s.to_string()).collect(), *msat))
+            .collect()
+    }
+
+    const A: &[&str] = &["1x1x1/0", "2x2x2/1", "3x3x3/0"];
+    const B: &[&str] = &["1x1x1/0", "4x4x4/1", "3x3x3/0"];
+
+    #[test]
+    fn route_path_is_the_hop_sequence() {
+        assert_eq!(route_path(&route(A, 5)), A.to_vec());
+        assert!(route_path(&json!({})).is_empty());
+    }
+
+    // The msat shave: the same path one msat under the failed
+    // amount is a retry; so is the failed amount itself.
+    #[test]
+    fn a_msat_under_the_failure_is_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_999_999)],
+            &tried,
+            1
+        ));
+        assert!(retries_liquidity_failures(
+            &[route(A, 200_000_000)],
+            &tried,
+            1
+        ));
+    }
+
+    // More than a fragment below the failure is a real step.
+    #[test]
+    fn more_than_a_fragment_below_the_failure_is_not_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_000_000)],
+            &tried,
+            1_000_000
+        ));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 198_999_999)],
+            &tried,
+            1_000_000
+        ));
+    }
+
+    // One untried path in the plan makes the round worth sending.
+    #[test]
+    fn an_untried_path_is_not_a_retry() {
+        let tried = failed(&[(A, 200_000_000)]);
+        assert!(!retries_liquidity_failures(
+            &[route(B, 199_999_999)],
+            &tried,
+            1
+        ));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 199_999_999), route(B, 1)],
+            &tried,
+            1
+        ));
+        assert!(retries_liquidity_failures(
+            &[route(A, 199_999_999), route(B, 49_999_999)],
+            &failed(&[(A, 200_000_000), (B, 50_000_000)]),
+            1
+        ));
+    }
+
+    #[test]
+    fn nothing_planned_or_nothing_failed_is_not_a_retry() {
+        assert!(!retries_liquidity_failures(&[], &failed(&[(A, 1)]), 1));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 1)],
+            &HashMap::new(),
+            1
+        ));
     }
 
     #[test]

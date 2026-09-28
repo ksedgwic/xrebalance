@@ -107,6 +107,27 @@ const OPT_MIN_PART: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
     multi: false,
 };
 
+/// Least success estimate a planned part may have, in percent.
+/// askrene reports a probability_ppm per route: the product over the
+/// hops of a linear estimate between each channel's known minimum
+/// and maximum liquidity (our own hops score 1.0).  A part below the
+/// floor is dropped after the solve and not sent; when every part is
+/// dropped the round sends nothing, as when no route is found.  The
+/// check reads one number off each plan and keeps no state.  The
+/// unit is percent, not ppm, so the value does not read as a fee
+/// rate; whole percents are resolution enough for this estimate.
+/// 0 disables the floor: no estimate is below it.
+const OPT_MIN_PROBABILITY: DefaultIntegerConfigOption = DefaultIntegerConfigOption {
+    name: "xrebalance-min-probability-percent",
+    default: 0,
+    description: "least success estimate, in percent, a planned part \
+                  may have (per-request min_probability_percent overrides; \
+                  0 disables)",
+    deprecated: false,
+    dynamic: true,
+    multi: false,
+};
+
 /// How many plan-execute rounds one request may run (the
 /// per-request maxrounds overrides).  Each round replans the
 /// still-unmoved remainder against everything the earlier rounds'
@@ -183,6 +204,9 @@ pub struct State {
     /// Fragment floor: least msat a planned part may deliver
     /// (dynamic; read per request).
     pub min_part_msat: Arc<AtomicU64>,
+    /// Probability floor: least success estimate, in percent, a
+    /// planned part may have; 0 disables (dynamic; read per request).
+    pub min_probability_percent: Arc<AtomicU64>,
     /// Round cap for the tenacious loop (dynamic; read per
     /// request).
     pub max_rounds: Arc<AtomicU64>,
@@ -243,6 +267,11 @@ pub struct XRebalanceParams {
     /// Defaults to the xrebalance-max-rounds option.
     #[serde(default)]
     maxrounds: Option<u32>,
+    /// Probability-floor override: parts whose success estimate is
+    /// below this percentage are not sent; 0 sends every part.
+    /// Defaults to the xrebalance-min-probability-percent option.
+    #[serde(default)]
+    min_probability_percent: Option<u64>,
     /// Snapshot-window override: seconds the response waits for
     /// parts, 0 to return immediately.  Defaults to the
     /// xrebalance-part-wait option.  Results stream via the
@@ -273,6 +302,12 @@ pub fn eng(n: u64) -> String {
     out
 }
 
+/// Render a parts-per-million value as a percentage with one
+/// decimal for log lines: 900_000 -> "90.0".  JSON keeps the ppm.
+pub fn percent(ppm: u64) -> String {
+    format!("{:.1}", ppm as f64 / 10_000.0)
+}
+
 fn main() -> Result<(), Error> {
     // The framework's logger drops records below CLN_PLUGIN_LOG
     // (default info) inside the process, so our per-request detail
@@ -296,6 +331,7 @@ async fn run() -> Result<(), Error> {
         .option(OPT_OVERRIDE_AGE)
         .option(OPT_PART_WAIT)
         .option(OPT_MIN_PART)
+        .option(OPT_MIN_PROBABILITY)
         .option(OPT_MAX_ROUNDS)
         .option(OPT_FINAL_CLTV)
         .notification(messages::NotificationTopic::new(TOPIC_PART))
@@ -327,6 +363,10 @@ async fn run() -> Result<(), Error> {
         .map_err(|_| anyhow!("xrebalance-part-wait must be positive"))?;
     let min_part = u64::try_from(configured.option(&OPT_MIN_PART)?)
         .map_err(|_| anyhow!("xrebalance-min-part-msat must not be negative"))?;
+    let min_probability = u64::try_from(configured.option(&OPT_MIN_PROBABILITY)?)
+        .ok()
+        .filter(|&p| p <= 100)
+        .ok_or_else(|| anyhow!("xrebalance-min-probability-percent must be 0 to 100"))?;
     let max_rounds = u64::try_from(configured.option(&OPT_MAX_ROUNDS)?)
         .ok()
         .filter(|&r| r >= 1)
@@ -340,6 +380,7 @@ async fn run() -> Result<(), Error> {
         constraint_age: Arc::new(AtomicU64::new(constraint_age)),
         part_wait_secs: Arc::new(AtomicU64::new(part_wait)),
         min_part_msat: Arc::new(AtomicU64::new(min_part)),
+        min_probability_percent: Arc::new(AtomicU64::new(min_probability)),
         max_rounds: Arc::new(AtomicU64::new(max_rounds)),
         final_cltv: Arc::new(AtomicU64::new(final_cltv)),
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -352,12 +393,14 @@ async fn run() -> Result<(), Error> {
     let plugin = configured.start(state).await?;
     log::info!(
         "xrebalance v{} started: constraint-age {}s, override-age {}s, \
-         part-wait {}s, min-part {}msat, max-rounds {}, final-cltv {}",
+         part-wait {}s, min-part {}msat, min-probability {}%, \
+         max-rounds {}, final-cltv {}",
         env!("CARGO_PKG_VERSION"),
         eng(constraint_age),
         eng(override_age),
         eng(part_wait),
         eng(min_part),
+        eng(min_probability),
         eng(max_rounds),
         final_cltv,
     );
@@ -408,6 +451,9 @@ async fn xrebalance(
     }
     if parsed.maxrounds == Some(0) {
         return Err(anyhow!("maxrounds must be at least 1"));
+    }
+    if parsed.min_probability_percent.is_some_and(|p| p > 100) {
+        return Err(anyhow!("min_probability_percent must be at most 100"));
     }
     if parsed.amount_msat == 0 {
         return Err(anyhow!("amount_msat must be positive"));
@@ -477,6 +523,11 @@ async fn xrebalance(
     // whole request, not each round.
     let mut source_committed: HashMap<String, u64> = HashMap::new();
     let mut dest_committed: HashMap<String, u64> = HashMap::new();
+    // The paths this request has failed for liquidity, each with
+    // the amount that failed, so a later plan that only retries
+    // them is not sent (see retries_liquidity_failures).
+    let mut liquidity_failed: HashMap<Vec<String>, u64> = HashMap::new();
+    let fragment_msat = state.min_part_msat.load(Ordering::Relaxed).max(1);
     let mut round: u64 = 0;
     let stop_reason: String;
     loop {
@@ -486,16 +537,13 @@ async fn xrebalance(
         // double-spending its liquidity on a retry.
         let committed = delivered_total.saturating_add(pending_total);
         let remaining = parsed.amount_msat.saturating_sub(committed);
-        if round > 1 {
-            let floor = state.min_part_msat.load(Ordering::Relaxed).max(1);
-            if remaining < floor {
-                stop_reason = if remaining == 0 {
-                    "amount fully committed".into()
-                } else {
-                    format!("remaining {}msat below the fragment floor", eng(remaining))
-                };
-                break;
-            }
+        if round > 1 && remaining < fragment_msat {
+            stop_reason = if remaining == 0 {
+                "amount fully committed".into()
+            } else {
+                format!("remaining {}msat below the fragment floor", eng(remaining))
+            };
+            break;
         }
         let mut round_params = parsed.clone();
         round_params.amount_msat = remaining;
@@ -529,6 +577,22 @@ async fn xrebalance(
                     .unwrap_or("planner returned no routes"),
             );
         }
+        // A liquidity failure at X is stored as "at most X - 1", so
+        // the next solve may plan the same path one msat lower,
+        // round after round; each failure is a feedback write, so
+        // the stall check below never sees it.  A plan that only
+        // retries failed paths within a fragment of their amounts
+        // ends the request unsent.
+        if round > 1
+            && plan::retries_liquidity_failures(&planned.routes, &liquidity_failed, fragment_msat)
+        {
+            stop_reason = format!(
+                "stalled: every planned part retries a route this request \
+                 already failed for liquidity, within {} msat of the amount",
+                eng(fragment_msat)
+            );
+            break;
+        }
         let outcome = match exec::execute(&_plugin, &round_params, &planned, started).await {
             Ok(o) => o,
             Err(e) if round > 1 => {
@@ -547,6 +611,7 @@ async fn xrebalance(
         for (scid, msat) in &outcome.dest_committed_msat {
             *dest_committed.entry(scid.clone()).or_default() += *msat;
         }
+        liquidity_failed.extend(outcome.liquidity_failed);
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
@@ -768,6 +833,7 @@ async fn xrebalance_stats(
                 .max_age(),
             "part_wait": state.part_wait_secs.load(Ordering::Relaxed),
             "min_part_msat": state.min_part_msat.load(Ordering::Relaxed),
+            "min_probability_percent": state.min_probability_percent.load(Ordering::Relaxed),
             "max_rounds": state.max_rounds.load(Ordering::Relaxed),
             "final_cltv": state.final_cltv.load(Ordering::Relaxed),
         },
@@ -823,6 +889,14 @@ async fn setconfig(
         }
         "xrebalance-min-part-msat" => {
             state.min_part_msat.store(value, Ordering::Relaxed);
+        }
+        "xrebalance-min-probability-percent" => {
+            if value > 100 {
+                return Err(anyhow!("{name} must be at most 100"));
+            }
+            state
+                .min_probability_percent
+                .store(value, Ordering::Relaxed);
         }
         "xrebalance-max-rounds" => {
             if value < 1 {
@@ -927,7 +1001,9 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_down, eng, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict};
+    use super::{
+        draw_down, eng, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict,
+    };
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1022,6 +1098,15 @@ mod tests {
         assert_eq!(eng(1000), "1_000");
         assert_eq!(eng(10005958), "10_005_958");
         assert_eq!(eng(u64::MAX), "18_446_744_073_709_551_615");
+    }
+
+    #[test]
+    fn percent_renders_ppm() {
+        assert_eq!(percent(0), "0.0");
+        assert_eq!(percent(5), "0.0");
+        assert_eq!(percent(12_345), "1.2");
+        assert_eq!(percent(900_000), "90.0");
+        assert_eq!(percent(1_000_000), "100.0");
     }
 
     fn hash() -> String {

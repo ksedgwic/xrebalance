@@ -2,11 +2,17 @@
 //! channel_update, and attribute a FEE_INSUFFICIENT to the side of
 //! the erring node actually at fault.
 
-/// BOLT 4 onion failure code -> short human-readable name, so the
-/// failcode can be grepped by name in logs rather than only the
-/// hex.  "UNKNOWN" for codes not in the table.
+/// BOLT 4 onion failure code -> its name, so the failcode can be
+/// grepped by name in logs rather than only the hex.  Every code in
+/// the BOLT 4 table (CLN wire/onion_wire.csv); "UNKNOWN" for
+/// anything else.  The flag bits are BADONION 0x8000, PERM 0x4000,
+/// NODE 0x2000, UPDATE 0x1000.
 pub fn failcode_name(failcode: u64) -> &'static str {
     match failcode {
+        0x12 => "FINAL_INCORRECT_CLTV_EXPIRY",
+        0x13 => "FINAL_INCORRECT_HTLC_AMOUNT",
+        0x15 => "EXPIRY_TOO_FAR",
+        0x17 => "MPP_TIMEOUT",
         0x1007 => "TEMPORARY_CHANNEL_FAILURE",
         0x100b => "AMOUNT_BELOW_MINIMUM",
         0x100c => "FEE_INSUFFICIENT",
@@ -14,10 +20,18 @@ pub fn failcode_name(failcode: u64) -> &'static str {
         0x100e => "EXPIRY_TOO_SOON",
         0x1014 => "CHANNEL_DISABLED",
         0x2002 => "TEMPORARY_NODE_FAILURE",
+        0x4001 => "INVALID_REALM",
         0x4008 => "PERMANENT_CHANNEL_FAILURE",
+        0x4009 => "REQUIRED_CHANNEL_FEATURE_MISSING",
         0x400a => "UNKNOWN_NEXT_PEER",
-        0x4010 => "REQUIRED_CHANNEL_FEATURE_MISSING",
+        0x400f => "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS",
+        0x4016 => "INVALID_ONION_PAYLOAD",
         0x6002 => "PERMANENT_NODE_FAILURE",
+        0x6003 => "REQUIRED_NODE_FEATURE_MISSING",
+        0xc004 => "INVALID_ONION_VERSION",
+        0xc005 => "INVALID_ONION_HMAC",
+        0xc006 => "INVALID_ONION_KEY",
+        0xc018 => "INVALID_ONION_BLINDING",
         _ => "UNKNOWN",
     }
 }
@@ -415,8 +429,17 @@ mod tests {
 
     #[test]
     fn failcode_names() {
+        assert_eq!(failcode_name(0x15), "EXPIRY_TOO_FAR");
+        assert_eq!(failcode_name(0x17), "MPP_TIMEOUT");
         assert_eq!(failcode_name(0x100c), "FEE_INSUFFICIENT");
         assert_eq!(failcode_name(0x1014), "CHANNEL_DISABLED");
+        assert_eq!(failcode_name(0x4009), "REQUIRED_CHANNEL_FEATURE_MISSING");
+        assert_eq!(
+            failcode_name(0x400f),
+            "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"
+        );
+        assert_eq!(failcode_name(0xc005), "INVALID_ONION_HMAC");
+        assert_eq!(failcode_name(0x4010), "UNKNOWN");
         assert_eq!(failcode_name(0xdead), "UNKNOWN");
     }
 

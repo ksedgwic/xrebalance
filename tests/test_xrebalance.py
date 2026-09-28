@@ -115,6 +115,9 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert res['fee_msat'] == expected_fee, res
     assert part['fee_msat'] == expected_fee, res
     assert part['sent_msat'] == 100000 + expected_fee, res
+    # askrene's success estimate for the route, carried from the plan
+    # so the outcome can be joined to it.
+    assert 0 <= part['probability_ppm'] <= 1_000_000, res
 
     # Our side of the fill channel grew by exactly the delivered
     # amount: the self-payment settled via the htlc_accepted claimer.
@@ -128,6 +131,14 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert l1.daemon.is_in_log(
         r"subscriber got xrebalance_part:.*%s"
         % only_one(res['parts'])['payment_hash'])
+    # The plan summary and the part's outcome line both carry the
+    # estimate, so the two can be joined from the log alone.
+    assert l1.daemon.is_in_log(
+        r"planned 1 part\(s\), success probability "
+        r"[0-9.]+/[0-9.]+/[0-9.]+% min/median/max per part, "
+        r"expected delivery [0-9.]+% of the planned amount")
+    assert l1.daemon.is_in_log(
+        r"part +1/ +1 complete: .*, probability +[0-9.]+%")
 
     # Success feedback: the one NETWORK hop of the route (l2 -> l3;
     # first and return hops are ours and excluded) must now carry an
@@ -210,6 +221,9 @@ def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     assert res['pending_msat'] == 0, res
 
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
+    # A failed part's line carries the estimate too.
+    assert l1.daemon.is_in_log(
+        r"part +1/ +1 failed.*, probability +[0-9.]+%")
 
     # Failure feedback: the erring direction (l2 -> l3) now carries a
     # constrained record in the persistent layer.
@@ -394,6 +408,124 @@ def test_min_part_floor(node_factory, bitcoind, plugin_opts):
     # The dynamic value is visible in the stats.
     stats = l1.rpc.call('xrebalance-stats')
     assert stats['options']['min_part_msat'] == 60_000, stats
+
+
+def test_min_probability_floor(node_factory, bitcoind, plugin_opts):
+    """The probability floor drops planned parts whose success
+    estimate from askrene is below it; a plan left with no parts
+    reports why and moves nothing.  Off by default (0), dynamic via
+    setconfig, and overridable per request.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[plugin_opts, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    ask = dict(sources=[src], destinations=[scid_fill],
+               amount_msat=100_000, maxfee_msat=5_000, dryrun=True)
+
+    # Off by default: the part is planned, and its estimate is high
+    # but short of certain (one network hop with unknown liquidity).
+    res = l1.rpc.xrebalance(**ask)
+    estimate = only_one(res['routes'])['probability_ppm']
+    assert 990_000 <= estimate < 1_000_000, res
+    stats = l1.rpc.call('xrebalance-stats')
+    assert stats['options']['min_probability_percent'] == 0, stats
+
+    # A floor above the estimate drops the part: nothing is planned,
+    # and the detail says why.
+    l1.rpc.setconfig('xrebalance-min-probability-percent', 100)
+    res = l1.rpc.xrebalance(**ask)
+    assert res['routes'] == [], res
+    assert res['delivered_msat'] == 0, res
+    assert 'under the probability floor' in res['detail'], res
+    assert l1.daemon.is_in_log(
+        r"pruned 1 part\(s\) under the probability floor")
+
+    # The per-request value overrides the option, in both directions.
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=0)
+    assert only_one(res['routes'])['probability_ppm'] == estimate, res
+    l1.rpc.setconfig('xrebalance-min-probability-percent', 0)
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=100)
+    assert res['routes'] == [], res
+
+    # A floor just under the estimate keeps the part.
+    res = l1.rpc.xrebalance(**ask, min_probability_percent=99)
+    assert only_one(res['routes'])['probability_ppm'] == estimate, res
+
+    # Out-of-range values are refused, option and parameter alike.
+    with pytest.raises(RpcError, match='at most 100'):
+        l1.rpc.setconfig('xrebalance-min-probability-percent', 101)
+    with pytest.raises(RpcError, match='at most 100'):
+        l1.rpc.xrebalance(**ask, min_probability_percent=101)
+
+
+def test_retry_stop(node_factory, bitcoind, plugin_opts):
+    """A liquidity failure teaches askrene that the erring channel
+    carries less than the failed amount, stored as an upper bound one
+    msat under it.  When an earlier crossing recorded a lower bound at
+    or above that, askrene takes the lower bound as wrong and the
+    channel as exactly known: the next solve fills it to the bound at
+    no probability cost, so the same route is planned one msat lower
+    with the same high estimate; sent, it fails the same way, and the
+    request would run to maxrounds one msat at a time.  The loop must
+    instead end, unsent, when a plan only retries routes this request
+    already failed for liquidity within a fragment of the amount.
+    """
+    # l1 -> l2 -> l3 is the corridor.  l1 -> l4 -> l3 charges
+    # 3000 ppm and is wide: the solve at the full amount succeeds
+    # with the excess on it, but every part over it is pruned
+    # against the fee rate cap and never sent.
+    l1, l2, l3, l4 = node_factory.get_nodes(
+        4, opts=[plugin_opts, {}, {}, {'fee-per-satoshi': 3000}])
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
+    node_factory.join_nodes([l1, l4], wait_for_announce=True)
+    l4.fundwallet(11_000_000)
+    scid43, _ = l4.fundchannel(l3, 10_000_000, wait_for_active=True)
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+    bitcoind.generate_block(6)
+    wait_for(lambda: len(l1.rpc.listchannels(scid43)['channels']) == 2)
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    src12 = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    src14 = only_one(
+        l1.rpc.listpeerchannels(l4.info['id'])['channels'])['short_channel_id']
+
+    # A delivered part records l2 -> l3 as good for 140M.
+    res = l1.rpc.xrebalance(sources=[src12], destinations=[scid_fill],
+                            amount_msat=140_000_000, maxfee_msat=100_000,
+                            maxrounds=1, label='prime')
+    assert res['delivered_msat'] == 140_000_000, res
+
+    # Then l2 pays most of that side away, so the next 140M part
+    # fails at l2 -> l3 and records an upper bound under the lower.
+    l2.pay(l3, 800_000_000)
+    wait_for(lambda: only_one(
+        l2.rpc.listpeerchannels(l3.info['id'])['channels'])['spendable_msat']
+        < 100_000_000)
+
+    # 1000 ppm: the l4 corridor's parts are pruned; the corridor
+    # takes the 60M above what l2 -> l3 is known good for.
+    res = l1.rpc.xrebalance(sources=[src12, src14], destinations=[scid_fill],
+                            amount_msat=200_000_000, maxfee_msat=200_000,
+                            maxrounds=8, label='shave')
+    assert res['status'] == 'executed', res
+    assert res['stop_reason'].startswith(
+        'stalled: every planned part retries a route'), res
+    assert res['rounds_run'] == 1, res
+    assert res['delivered_msat'] == 0, res
+    # The estimate never saw the shave: the known channel scores 1.
+    assert l1.daemon.is_in_log(
+        r"req shave: part +1/ +1 failed.*probability 100.0%")
+    l1.daemon.wait_for_log(
+        r"req shave: finished after 1 round\(s\): stalled: every planned "
+        r"part retries a route")
 
 
 def test_maxrounds(node_factory, bitcoind, plugin_opts):

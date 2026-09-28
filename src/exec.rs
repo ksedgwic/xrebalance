@@ -36,7 +36,7 @@ use crate::onion_error::{
     classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate, FeeFault,
 };
 use crate::plan::{fee_ppm, PlanResult, PERSISTENT_LAYER};
-use crate::{eng, Claim, State, XRebalanceParams, TOPIC_PART};
+use crate::{eng, percent, Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
 const WAITSENDPAY_TIMEOUT: i32 = 200;
@@ -58,6 +58,13 @@ const WIRE_FEE_INSUFFICIENT: u64 = 0x100c;
 /// channel_disabled (UPDATE|20).  Each becomes a stored policy
 /// override (overrides.rs).
 const WIRE_POLICY_CARRYING: [u64; 4] = [0x100b, 0x100d, 0x100e, 0x1014];
+
+/// BOLT 4 expiry_too_far (21): the forwarder refuses an HTLC whose
+/// expiry lies further ahead than its own locktime limit.  The
+/// limit is the forwarder's policy and is not gossiped, so the
+/// direction is excluded in the override store for one
+/// override-age; the next plan routes around it.
+const WIRE_EXPIRY_TOO_FAR: u64 = 0x15;
 
 /// BOLT 4 unknown_next_peer (PERM|10): the forwarder has no usable
 /// next channel -- closed but still gossiped, or the peer is
@@ -152,6 +159,9 @@ struct Part {
     planned_sent_msat: u64,
     /// The route's hops, for writing outcome feedback.
     hops: Vec<PartHop>,
+    /// askrene's success estimate for the route at plan time, kept
+    /// so the outcome can be joined to it.
+    probability_ppm: Option<u64>,
     status: &'static str,
     detail: Option<String>,
     /// Failure geometry, set at terminal state: how many hops of
@@ -196,6 +206,7 @@ impl Part {
             "delivered_msat": self.delivered_msat(),
             "sent_msat": self.planned_sent_msat,
             "fee_msat": self.fee_msat(),
+            "probability_ppm": self.probability_ppm,
             "hops_short": self.hops_short,
             "failcode": self.failcode,
             "erring_scidd": self.erring_scidd,
@@ -292,6 +303,11 @@ async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, 
 /// override for future request layers, or exclude the direction
 /// when the forwarder blanked the update (apply_policy_refresh).
 ///
+/// Locktime failures (expiry_too_far at hop N): the forwarder's
+/// limit, not gossiped; exclude the direction for an override-age
+/// (the hops before it forwarded, so they are informed
+/// unconstrained as for a liquidity failure).
+///
 /// Node-level failures: disable the forwarder for a while -- but
 /// never our own node, which in a circular rebalance is also the
 /// destination; disabling self would take every channel we have out
@@ -327,11 +343,13 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
             let policy_carrying = WIRE_POLICY_CARRYING.contains(&failcode);
             let node_failure = failcode & NODE_BIT != 0;
             let dead_next = failcode == WIRE_UNKNOWN_NEXT_PEER;
+            let expiry_too_far = failcode == WIRE_EXPIRY_TOO_FAR;
             if failcode != WIRE_TEMPORARY_CHANNEL_FAILURE
                 && !fee_insufficient
                 && !policy_carrying
                 && !node_failure
                 && !dead_next
+                && !expiry_too_far
             {
                 return;
             }
@@ -386,6 +404,17 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 return;
             }
             let erring = &part.hops[erring_idx];
+            if expiry_too_far {
+                if !erring.ours {
+                    record_exclusion(state, &erring.scidd);
+                    log::debug!(
+                        "expiry_too_far at {}: the forwarder's locktime limit; \
+                         excluded",
+                        erring.scidd,
+                    );
+                }
+                return;
+            }
             if !erring.ours {
                 // A liquidity failure constrains at the amount that
                 // could not pass; a dead next-channel is excluded
@@ -565,6 +594,10 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
 /// one summary log line (debug; the per-hop detail is at trace).
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
     let req = label.as_deref().unwrap_or("?");
+    let prob = match part.probability_ppm {
+        Some(p) => format!(", probability {:>5}%", percent(p)),
+        None => String::new(),
+    };
     if part.status == "complete" {
         let fee = part.fee_msat();
         let ppm = if part.planned_msat > 0 {
@@ -574,7 +607,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         };
         log::debug!(
             "req {req}: part {:>2}/{:>2} complete: delivered {:>13} msat \
-             fee {:>9} msat ({:>6} ppm)",
+             fee {:>9} msat ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.delivered_msat()),
@@ -597,7 +630,7 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         let planned_fee = part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
             "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
-             {:>13} msat ({:>6} ppm)",
+             {:>13} msat ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
@@ -689,6 +722,10 @@ pub struct ExecOutcome {
     /// absolute fee budget.
     pub source_committed_msat: HashMap<String, u64>,
     pub dest_committed_msat: HashMap<String, u64>,
+    /// The parts that failed for liquidity, by path, with the
+    /// amount each was to deliver: what the request loop (main.rs)
+    /// checks the next plan against before sending it.
+    pub liquidity_failed: HashMap<Vec<String>, u64>,
 }
 
 /// The channel half of a "scid/dir" string.
@@ -711,11 +748,27 @@ fn committed_by_target(parts: &[Part]) -> (HashMap<String, u64>, HashMap<String,
     (by_source, by_dest)
 }
 
+/// The parts that failed with temporary_channel_failure, by path,
+/// each with the amount it was to deliver.
+fn liquidity_failed_by_path(parts: &[Part]) -> HashMap<Vec<String>, u64> {
+    parts
+        .iter()
+        .filter(|p| p.status == "failed" && p.failcode == Some(WIRE_TEMPORARY_CHANNEL_FAILURE))
+        .map(|p| {
+            (
+                p.hops.iter().map(|h| h.scidd.clone()).collect(),
+                p.planned_msat,
+            )
+        })
+        .collect()
+}
+
 /// Bundle the terminal render with the cross-round totals.
 fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> ExecOutcome {
     let pending: Vec<&Part> = parts.iter().filter(|p| p.status == "pending").collect();
     let (source_committed_msat, dest_committed_msat) = committed_by_target(parts);
     ExecOutcome {
+        liquidity_failed: liquidity_failed_by_path(parts),
         delivered_msat: parts.iter().map(Part::delivered_msat).sum(),
         fee_msat: parts.iter().map(Part::fee_msat).sum(),
         pending_msat: pending.iter().map(|p| p.planned_msat).sum(),
@@ -820,6 +873,7 @@ pub async fn execute(
             planned_msat,
             planned_sent_msat: first["amount_in_msat"].as_u64().unwrap_or(0),
             hops,
+            probability_ppm: route["probability_ppm"].as_u64(),
             status: "pending",
             detail: None,
             hops_short: None,
@@ -1007,6 +1061,7 @@ mod tests {
             constraint_age: Arc::new(AtomicU64::new(6 * 60 * 60)),
             part_wait_secs: Arc::new(AtomicU64::new(0)),
             min_part_msat: Arc::new(AtomicU64::new(0)),
+            min_probability_percent: Arc::new(AtomicU64::new(0)),
             max_rounds: Arc::new(AtomicU64::new(1)),
             final_cltv: Arc::new(AtomicU64::new(40)),
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1037,6 +1092,7 @@ mod tests {
             planned_msat: 0,
             planned_sent_msat: 0,
             hops,
+            probability_ppm: None,
             status: "failed",
             detail: None,
             hops_short: None,
