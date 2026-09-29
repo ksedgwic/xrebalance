@@ -962,7 +962,7 @@ async fn plan_in_layer(
         if !part_within_probability(probability_ppm, min_probability_ppm) {
             log::trace!(
                 "req {}: pruning part under the probability floor: {} msat \
-                 delivered, success probability {:>5}% (floor {}%)",
+                 delivered, {:>5}% success probability (floor {}%)",
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_delivered),
                 crate::percent(probability_ppm.unwrap_or(0)),
@@ -975,7 +975,7 @@ async fn plan_in_layer(
         if let Some(prob) = probability_ppm {
             log::trace!(
                 "req {}: planned part: {} msat delivered ({:>6} ppm), \
-                 success probability {:>5}%",
+                 {:>5}% success probability",
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_delivered),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),

@@ -138,7 +138,7 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
         r"[0-9.]+/[0-9.]+/[0-9.]+% min/median/max per part, "
         r"expected delivery [0-9.]+% of the planned amount")
     assert l1.daemon.is_in_log(
-        r"part +1/ +1 complete: .*, probability +[0-9.]+%")
+        r"part +1/ +1 complete: .*, +[0-9.]+% probability")
 
     # Success feedback: the one NETWORK hop of the route (l2 -> l3;
     # first and return hops are ours and excluded) must now carry an
@@ -223,7 +223,7 @@ def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
     # A failed part's line carries the estimate too.
     assert l1.daemon.is_in_log(
-        r"part +1/ +1 failed.*, probability +[0-9.]+%")
+        r"part +1/ +1 failed.*, +[0-9.]+% probability")
 
     # Failure feedback: the erring direction (l2 -> l3) now carries a
     # constrained record in the persistent layer.
@@ -522,7 +522,7 @@ def test_retry_stop(node_factory, bitcoind, plugin_opts):
     assert res['delivered_msat'] == 0, res
     # The estimate never saw the shave: the known channel scores 1.
     assert l1.daemon.is_in_log(
-        r"req shave: part +1/ +1 failed.*probability 100.0%")
+        r"req shave: part +1/ +1 failed.*, 100.0% probability")
     l1.daemon.wait_for_log(
         r"req shave: finished after 1 round\(s\): stalled: every planned "
         r"part retries a route")

@@ -592,10 +592,13 @@ fn log_route(part_index: u64, payment_hash: &str, path: &[Value]) {
 /// notification must not fail the part.  Every terminal part
 /// passes through here, so this is also where each part gets its
 /// one summary log line (debug; the per-hop detail is at trace).
+/// In that line each label follows its value and unit, so the
+/// padding of a right-aligned number falls between fields and not
+/// between a label and its value.
 async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part) {
     let req = label.as_deref().unwrap_or("?");
     let prob = match part.probability_ppm {
-        Some(p) => format!(", probability {:>5}%", percent(p)),
+        Some(p) => format!(", {:>5}% probability", percent(p)),
         None => String::new(),
     };
     if part.status == "complete" {
@@ -606,8 +609,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
             0
         };
         log::debug!(
-            "req {req}: part {:>2}/{:>2} complete: delivered {:>13} msat \
-             fee {:>9} msat ({:>6} ppm){prob}",
+            "req {req}: part {:>2}/{:>2} complete: {:>13} msat delivered, \
+             {:>9} msat fee ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.delivered_msat()),
@@ -629,8 +632,8 @@ async fn notify_part(plugin: &Plugin<State>, label: &Option<String>, part: &Part
         };
         let planned_fee = part.planned_sent_msat.saturating_sub(part.planned_msat);
         log::debug!(
-            "req {req}: part {:>2}/{:>2} failed{geometry}{code}, planned \
-             {:>13} msat ({:>6} ppm){prob}",
+            "req {req}: part {:>2}/{:>2} failed{geometry}{code}, \
+             {:>13} msat planned ({:>6} ppm){prob}",
             part.part_index,
             part.parts_total,
             eng(part.planned_msat),
