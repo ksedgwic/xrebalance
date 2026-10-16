@@ -114,18 +114,24 @@ spellings:
 The effective per-channel bound is always the **smaller** of the cap
 and the channel's live liquidity; a cap of 0 excludes the channel
 from this request.  A source's cap bounds what crosses the channel —
-delivered amount plus downstream fees — and the solver honors it to
-its routing granularity (about 0.1% of the amount), so caps are
-approximate limits, not exact accounting bounds.  Programs composing
-JSON (CLBOSS) should prefer the object form; the string forms are
-for humans at a CLI.
+delivered amount plus downstream fees.  The solver packs a source in
+flow units of about a thousandth of the amount, so a cap is honored
+to within one unit, not to the msat.  The planner writes each source
+bound one msat short of a unit multiple: the packing stops a whole
+unit under the bound, and that unit is left for the per-part fees
+and the commitment-fee reserve askrene adds on channels this node
+opened, which the solver's refine stage charges against the same
+bound.  Programs composing JSON (CLBOSS) should prefer the object
+form; the string forms are for humans at a CLI.
 
 `amount_msat` remains the request-wide ceiling.  The planner clamps
 it to what the channels can carry: the smaller of the summed source
 bounds — less the fee budget, since fees ride the source channels on
-top of the delivered amount — and the summed destination bounds.  In
-particular, an `amount_msat` larger than a source can carry drains
-the source rather than planning nothing.
+top of the delivered amount, and less the flow units the solver's
+packing can lose to rounding, two per source and one more — and the
+summed destination bounds.  In particular, an `amount_msat` larger
+than a source can carry drains the source rather than planning
+nothing.
 
 askrene plans for payments, where delivering less than the asked
 amount is failure, so each solve is all-or-nothing.  A rebalance

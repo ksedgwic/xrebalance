@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::spec::{bound_with_unit_slack, flow_unit_msat, unit_headroom_msat};
 use crate::{State, XRebalanceParams};
 
 /// The stand-in destination node id.  Not a valid curve point; must
@@ -347,19 +348,30 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     // first (worst case: every budgeted msat is spent).  The
     // destination side needs no headroom -- the last hop delivers
     // net of fees.
-    let src_movable = match (params.maxfee_msat, params.maxfee_ppm) {
-        (Some(msat), None) => src_bound.saturating_sub(msat),
+    let after_fees = |bound: u64| match (params.maxfee_msat, params.maxfee_ppm) {
+        (Some(msat), None) => bound.saturating_sub(msat),
         (None, Some(ppm)) => {
-            u64::try_from(u128::from(src_bound) * 1_000_000 / (1_000_000 + u128::from(ppm)))
+            u64::try_from(u128::from(bound) * 1_000_000 / (1_000_000 + u128::from(ppm)))
                 .expect("shrunk from a u64")
         }
         _ => unreachable!("validated by caller"),
     };
+    // The solver draws on each source in whole flow units (spec.rs,
+    // unit_headroom_msat), so the summed bounds overstate what it
+    // can draw by up to two units per source, and an ask clamped to
+    // the bare sum fails its top rung.  The unit headroom comes off
+    // the source side as well, sized from the ask before it (its
+    // unit is no smaller than the final one, so the room suffices).
+    let unit_headroom = unit_headroom_msat(
+        params.sources.len(),
+        params.amount_msat.min(after_fees(src_bound)).min(dst_bound),
+    );
+    let src_movable = after_fees(src_bound.saturating_sub(unit_headroom));
     let amount_msat = params.amount_msat.min(src_movable).min(dst_bound);
     if amount_msat < params.amount_msat {
         log::debug!(
             "req {}: amount clamped to {}msat (requested {}, sources \
-             carry {} after fee headroom, destinations carry {})",
+             carry {} after fee and unit headroom, destinations carry {})",
             params.label.as_deref().unwrap_or("?"),
             crate::eng(amount_msat),
             crate::eng(params.amount_msat),
@@ -377,9 +389,9 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 
     if amount_msat == 0 {
         let side = if src_movable == 0 && dst_bound == 0 {
-            "sources (after fee headroom) and destinations leave"
+            "sources (after fee and unit headroom) and destinations leave"
         } else if src_movable == 0 {
-            "sources (after fee headroom) leave"
+            "sources (after fee and unit headroom) leave"
         } else {
             "destinations leave"
         };
@@ -578,6 +590,17 @@ async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
     Ok(())
 }
 
+/// A source's drain direction and the bounds on it: `bound` is what
+/// this request may draw through it (the cap under the live
+/// spendable), `solver_max` the maximum the solver currently sees
+/// for the arc -- auto.localchans' spendable until a lower bound is
+/// written into the request layer.
+struct SourceBound {
+    scidd: String,
+    bound: u64,
+    solver_max: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn plan_in_layer(
     rpc: &mut ClnRpc,
@@ -690,6 +713,9 @@ async fn plan_in_layer(
         .iter()
         .map(|s| (s.scid.as_str(), s.max_msat))
         .collect();
+    // Each source's drain direction with what this request may draw
+    // through it; the bounds are written per ladder rung below.
+    let mut src_bounds: Vec<SourceBound> = Vec::with_capacity(params.sources.len());
     for (scid, peer_id) in fence {
         call(
             rpc,
@@ -716,31 +742,14 @@ async fn plan_in_layer(
                 )
                 .await?;
             }
-            // A binding source cap is one extra max constraint on
-            // the real drain direction.  Layers intersect
-            // constraints, and the solver resolves the resulting
-            // min > max contradiction with auto.localchans' exact
-            // spendable assertion by trusting the max ("assume min
-            // is wrong", mcf.c), so the effective liquidity becomes
-            // min(cap, spendable) -- reality binds when it is the
-            // smaller.  A cap of 0 excludes the source outright.
-            // The MCF quantizes flow into ~amount/1000 units and
-            // may sit one unit past a knowledge bound, so a cap is
-            // honored to routing granularity, not to the msat.
-            Some(Some(cap)) if *cap < chans[scid].spendable_msat => {
-                call(
-                    rpc,
-                    "askrene-inform-channel",
-                    json!({
-                        "layer": split,
-                        "short_channel_id_dir": out_scidd,
-                        "amount_msat": cap + 1,
-                        "inform": "constrained",
-                    }),
-                )
-                .await?;
+            Some(cap) => {
+                let spendable = chans[scid].spendable_msat;
+                src_bounds.push(SourceBound {
+                    scidd: out_scidd,
+                    bound: cap.map_or(spendable, |cap| cap.min(spendable)),
+                    solver_max: spendable,
+                });
             }
-            Some(_) => {}
         }
     }
 
@@ -776,6 +785,50 @@ async fn plan_in_layer(
                 .expect("shrunk from a u64"),
             _ => unreachable!("validated by caller"),
         };
+        // Each source's bound for this rung: the cap under the live
+        // spendable, lowered to leave the rung's flow unit of slack
+        // for the per-part extras the solver's refine stage adds
+        // (spec.rs, bound_with_unit_slack).  The bound is one extra
+        // max constraint on the real drain direction; layers
+        // intersect constraints, and the solver resolves the min >
+        // max contradiction with auto.localchans' exact spendable
+        // assertion by trusting the max ("assume min is wrong",
+        // mcf.c).  Only a value under what the solver already sees
+        // takes effect, so each rung lowers the previous rung's
+        // value or writes nothing.  A cap of 0 excludes the source.
+        let mut written = 0usize;
+        for sb in &mut src_bounds {
+            let target = bound_with_unit_slack(sb.bound.min(sb.solver_max), rung);
+            if target >= sb.solver_max {
+                continue;
+            }
+            call(
+                rpc,
+                "askrene-inform-channel",
+                json!({
+                    "layer": split,
+                    "short_channel_id_dir": sb.scidd,
+                    "amount_msat": target + 1,
+                    "inform": "constrained",
+                }),
+            )
+            .await?;
+            sb.solver_max = target;
+            written += 1;
+        }
+        if let (true, Some(unit)) = (written > 0, flow_unit_msat(rung)) {
+            let under_cap: u64 = src_bounds
+                .iter()
+                .map(|sb| sb.bound.saturating_sub(sb.solver_max))
+                .sum();
+            log::debug!(
+                "req {}: {written} source bound(s) written for the {} msat flow unit, \
+                 {} msat under the caps in total",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(unit),
+                crate::eng(under_cap),
+            );
+        }
         let mut getroutes = json!({
             "source": self_id,
             "destination": FAKE_US_IN,

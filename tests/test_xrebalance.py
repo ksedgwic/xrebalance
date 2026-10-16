@@ -636,3 +636,81 @@ def test_fence_covers_spliced_channel(node_factory, bitcoind, plugin_opts):
         first = route['path'][0]['short_channel_id_dir']
         assert first.startswith(src), res
         assert not first.startswith(scid_direct), res
+
+
+def test_source_bound_leaves_room_for_part_extras(node_factory, bitcoind,
+                                                  plugin_opts):
+    """askrene packs a source in flow units (about a thousandth of the
+    ask) up to the bound it sees.  Its refine stage then reserves, per
+    part, the delivered amount plus downstream fees plus a
+    commitment-fee extra on channels this node opened, against the
+    same bound, and when a part came up short of its flow it grows the
+    others into the room it finds.  A bound that is a whole number of
+    units leaves no room for the extras: every part on the source is
+    over capacity, refine logs one BROKEN line per part per pass, and
+    the solve repeats.  The planner writes each source bound one msat
+    short of a unit multiple, so a whole unit is left for them, and
+    takes the units the packing can lose off the clamp so the top rung
+    stays feasible.
+
+    l1 -> l2 is the only source (l1 opened it).  l2 -> l3 and
+    l2 -> l4 -> l3 are each too thin for the ask alone, so the solve
+    splits into two parts through the source.  l2 -> l3 carries an
+    htlc_max just over a unit multiple and under l3's fee on the part,
+    so the flow builder fills it to the unit, refine shortens that part
+    by the fee and grows the other: the path on which the source bound
+    is checked.  The fee budget sits close over the fees, so the room
+    it leaves on the source is no cover for the extras (645_000 msat a
+    part at the regtest feerate).
+    """
+    l1, l2, l3, l4 = node_factory.get_nodes(
+        4, opts=[plugin_opts, {}, {'fee-base': 0, 'fee-per-satoshi': 100}, {}])
+    node_factory.join_nodes([l1, l2], fundamount=5_000_000,
+                            wait_for_announce=True)
+    node_factory.join_nodes([l2, l4], fundamount=3_000_000,
+                            wait_for_announce=True)
+    scid23, _ = l2.fundchannel(l3, 3_000_000, wait_for_active=True)
+    scid43, _ = l4.fundchannel(l3, 3_000_000, wait_for_active=True)
+    scid_fill, _ = l3.fundchannel(l1, 5_000_000, announce_channel=False)
+    bitcoind.generate_block(6)
+    scid24 = only_one(
+        l2.rpc.listpeerchannels(l4.info['id'])['channels'])['short_channel_id']
+    for scid in (scid23, scid43, scid24):
+        wait_for(lambda: len(l1.rpc.listchannels(scid)['channels']) == 2)
+
+    # The cap less the fee budget is 4 G, a whole number of flow units
+    # of 4 M; the clamp takes the budget and 2n + 1 = 3 units off it.
+    fee = 600_000
+    cap = 4_000_000_000 + fee
+    effective = cap - fee - 3 * -(-(cap - fee) // 1000)
+    unit = -(-effective // 1000)
+    htlc_max = 376 * unit + 100_000
+    l2.rpc.setchannel(scid23, htlcmax=htlc_max)
+    wait_for(lambda: only_one([
+        h for h in l1.rpc.listchannels(scid23)['channels']
+        if h['source'] == l2.info['id']])['htlc_maximum_msat'] == htlc_max)
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+
+    res = l1.rpc.xrebalance(sources=[{'scid': src, 'max_msat': cap}],
+                            destinations=[scid_fill],
+                            amount_msat=cap, maxfee_msat=fee, dryrun=True)
+    assert res['status'] == 'planned', res
+    # Every part fit its bound in refine: no overshoot was logged
+    # (pyln also fails the test on any BROKEN line at teardown).
+    assert not l1.daemon.is_in_log(
+        r'increase_flows: flow .* more than the path')
+    # The top rung routes at the clamped amount (no ladder descent).
+    assert res['effective_amount_msat'] == effective, res
+    assert l1.daemon.is_in_log(r'1 source bound\(s\) written for the')
+    assert len(res['routes']) == 2, res
+    # The l2 -> l3 part was shortened under its packed units and the
+    # other grew to the full amount, within the bound.
+    short = only_one([r for r in res['routes']
+                      if r['path'][1]['short_channel_id_dir'].startswith(scid23 + '/')])
+    assert short['path'][-1]['amount_out_msat'] < 376 * unit, short
+    assert res['delivered_msat'] == effective, res
+    crossing = sum(r['path'][0]['amount_in_msat'] for r in res['routes'])
+    assert crossing <= cap, (crossing, res)

@@ -122,9 +122,63 @@ pub fn find_duplicate(specs: &[ChanSpec]) -> Option<&str> {
         .map(|s| s.scid.as_str())
 }
 
+/// askrene routes an amount at or below this through one path
+/// carrying all of it (plugins/askrene/child/mcf.c,
+/// SINGLE_PATH_THRESHOLD); above it the solver works in flow units.
+pub const SINGLE_PATH_THRESHOLD_MSAT: u64 = 1_000_000;
+
+/// The flow unit askrene's multi-path solver quantizes an amount
+/// into: a thousandth of it, rounded up (mcf.c, accuracy).  None at
+/// or below the single-path threshold, where one flow carries the
+/// whole amount and nothing is quantized.
+pub fn flow_unit_msat(amount_msat: u64) -> Option<u64> {
+    (amount_msat > SINGLE_PATH_THRESHOLD_MSAT).then(|| amount_msat.div_ceil(1000))
+}
+
+/// A source bound lowered to leave the solver one flow unit of
+/// slack under it: the largest value at or below `bound_msat` that
+/// is one msat short of a multiple of the unit.
+///
+/// The solver sees a source as exactly known (auto.localchans
+/// asserts our spendable as min = max; a lower max written by us
+/// wins, mcf.c "assume min is wrong") and packs floor(bound / unit)
+/// units through it at no probability cost.  Its refine stage then
+/// reserves, per part, the delivered amount plus downstream fees
+/// plus a commitment-fee extra on channels we opened (172 weight
+/// units at the channel's feerate), against the same bound.  An
+/// arbitrary bound leaves refine only its remainder modulo the unit,
+/// and a part that does not fit is logged as BROKEN on every pass
+/// while the solve repeats; a bound one msat short of a unit
+/// multiple stops the packing a whole unit under it, and that unit
+/// takes the extras.  The slack is one unit at most: parts whose
+/// extras sum past a unit still overshoot.
+///
+/// At or below the single-path threshold the bound is returned as
+/// is: a single flow is checked without its own extra.
+pub fn bound_with_unit_slack(bound_msat: u64, amount_msat: u64) -> u64 {
+    match flow_unit_msat(amount_msat) {
+        None => bound_msat,
+        Some(unit) => (bound_msat.saturating_add(1) / unit * unit).saturating_sub(1),
+    }
+}
+
+/// What flow-unit rounding can cost the source side when the summed
+/// source bounds clamp the ask.  The solver draws at most floor(bound
+/// / unit) units from a source, under one unit short of the bound,
+/// and `bound_with_unit_slack` lowers the bound by under one more;
+/// the ask itself rounds up to whole units.  An ask at least 2n + 1
+/// units under the n summed bounds is feasible by local arithmetic;
+/// one clamped to the bare sum is not, and fails its top rung.  Zero
+/// at or below the single-path threshold.
+pub fn unit_headroom_msat(sources: usize, amount_msat: u64) -> u64 {
+    flow_unit_msat(amount_msat).map_or(0, |unit| unit.saturating_mul(2 * sources as u64 + 1))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{find_duplicate, ChanSpec};
+    use super::{
+        bound_with_unit_slack, find_duplicate, flow_unit_msat, unit_headroom_msat, ChanSpec,
+    };
 
     fn parse(json: &str) -> Result<ChanSpec, String> {
         serde_json::from_str::<ChanSpec>(json).map_err(|e| e.to_string())
@@ -224,6 +278,90 @@ mod tests {
         assert_eq!(spec("s", Some(5)).capped(7), 5);
         assert_eq!(spec("s", Some(9)).capped(7), 7);
         assert_eq!(spec("s", Some(0)).capped(7), 0);
+    }
+
+    #[test]
+    fn flow_unit_is_a_thousandth_rounded_up_above_single_path() {
+        assert_eq!(flow_unit_msat(1_000_000), None);
+        assert_eq!(flow_unit_msat(1_000_001), Some(1_001));
+        assert_eq!(flow_unit_msat(2_395_694_000), Some(2_395_694));
+        assert_eq!(flow_unit_msat(2_395_694_001), Some(2_395_695));
+    }
+
+    #[test]
+    fn unit_slack_bound_is_one_short_of_a_unit_multiple() {
+        // A 500 M cap under a 2.4 G ask (unit 2.4 M): the solver
+        // packs 207 units, and refine has 2_399_999 msat of room.
+        let w = bound_with_unit_slack(500_000_000, 2_400_000_000);
+        assert_eq!(w, 499_199_999);
+        assert_eq!(w / 2_400_000, 207);
+        assert_eq!(w % 2_400_000, 2_399_999);
+        // Never above the bound, never a whole unit under it.
+        for bound in [
+            0u64,
+            1,
+            2_399_998,
+            2_399_999,
+            2_400_000,
+            2_400_001,
+            499_999_999,
+            500_000_000,
+            500_000_001,
+        ] {
+            let w = bound_with_unit_slack(bound, 2_400_000_000);
+            assert!(w <= bound, "{bound}");
+            assert!(bound - w < 2_400_000, "{bound}");
+            assert!(w == 0 || (w + 1) % 2_400_000 == 0, "{bound}");
+        }
+        // A bound under one unit cannot pass a single unit: excluded.
+        assert_eq!(bound_with_unit_slack(2_399_998, 2_400_000_000), 0);
+        // At or below the single-path threshold nothing changes.
+        assert_eq!(bound_with_unit_slack(60_000, 55_000), 60_000);
+        assert_eq!(bound_with_unit_slack(60_000, 1_000_000), 60_000);
+    }
+
+    #[test]
+    fn unit_slack_bound_only_tightens_down_the_ladder() {
+        // Rewritten per rung from the previous rung's value, the
+        // bound never rises (a looser layer constraint is ignored)
+        // and stays aligned to each rung's unit.
+        let mut w = 500_000_000u64;
+        for rung in [
+            2_400_000_000u64,
+            1_800_000_000,
+            1_200_000_000,
+            600_000_000,
+            300_000_000,
+        ] {
+            let next = bound_with_unit_slack(w, rung);
+            assert!(next <= w, "{rung}");
+            assert_eq!((next + 1) % flow_unit_msat(rung).unwrap(), 0, "{rung}");
+            w = next;
+        }
+    }
+
+    #[test]
+    fn unit_headroom_makes_the_clamped_ask_feasible_in_units() {
+        assert_eq!(unit_headroom_msat(19, 1_000_000), 0);
+        assert_eq!(unit_headroom_msat(19, 2_400_000_000), 39 * 2_400_000);
+        // Sources whose summed bounds clamp the ask: after the
+        // headroom, the units the solver can draw cover the ask's
+        // units, whatever the bounds' remainders.
+        for bounds in [
+            vec![500_000_000u64; 5],
+            vec![499_999_999, 2_400_001, 123_456_789, 500_000_000, 7_654_321],
+            vec![2_000_000_001, 1],
+            vec![1_234_567; 30],
+        ] {
+            let sum: u64 = bounds.iter().sum();
+            let ask = sum - unit_headroom_msat(bounds.len(), sum);
+            let unit = flow_unit_msat(ask).unwrap();
+            let drawable: u64 = bounds
+                .iter()
+                .map(|b| bound_with_unit_slack(*b, ask) / unit)
+                .sum();
+            assert!(drawable >= ask.div_ceil(unit), "{bounds:?}");
+        }
     }
 
     #[test]
