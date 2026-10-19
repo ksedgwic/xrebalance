@@ -465,6 +465,68 @@ def test_min_probability_floor(node_factory, bitcoind, plugin_opts):
         l1.rpc.xrebalance(**ask, min_probability_percent=101)
 
 
+def test_first_hop_slot_cap(node_factory, bitcoind, plugin_opts, hold_htlcs):
+    """A channel holds at most max_accepted_htlcs outgoing HTLCs at
+    once; channeld refuses the next add with "Too many HTLCs" before
+    the part leaves.  The planner counts the free slots per first hop
+    and drops the parts past them: a part on a channel whose slots
+    are all in flight is not planned, and is again once one frees.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{**plugin_opts, 'max-concurrent-htlcs': 1},
+              {'plugin': hold_htlcs}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    chan12 = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
+    assert chan12['max_accepted_htlcs'] == 1, chan12
+    src = chan12['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    ask = dict(sources=[src], destinations=[scid_fill],
+               amount_msat=100_000, maxfee_msat=5_000, dryrun=True)
+
+    def htlcs_out():
+        return [h['direction'] for h in only_one(
+            l1.rpc.listpeerchannels(l2.info['id'])['channels'])['htlcs']]
+
+    # The one slot is free: the part is planned.
+    res = l1.rpc.xrebalance(**ask)
+    assert len(res['routes']) == 1, res
+
+    # A payment l2 holds takes the slot ...
+    inv = l2.rpc.invoice(1_000, 'hold', 'hold')
+    hop = {'id': l2.info['id'], 'channel': src,
+           'direction': int(l1.info['id'] > l2.info['id']),
+           'amount_msat': 1_000,
+           'delay': l2.rpc.listconfigs('cltv-final')['configs']
+           ['cltv-final']['value_int']}
+    l1.rpc.sendpay([hop], inv['payment_hash'],
+                   payment_secret=inv['payment_secret'])
+    wait_for(lambda: htlcs_out() == ['out'])
+
+    # ... and the plan drops the part rather than send it to be
+    # refused.
+    res = l1.rpc.xrebalance(**ask)
+    assert res['routes'] == [], res
+    assert res['delivered_msat'] == 0, res
+    assert res['detail'] == (
+        'all 1 planned parts had no free HTLC slot on their first hop'), res
+    assert l1.daemon.is_in_log(
+        r"pruned 1 part\(s\) without a free HTLC slot on their first hop "
+        r"\(100_000 msat foregone\): 1 on " + src + r" \(0 free\)")
+
+    # Released, the slot frees and the part is planned again.  (l2
+    # takes hold only once the HTLC is committed on its side, after
+    # l1 already lists it.)
+    l2.daemon.wait_for_log('holding htlc')
+    assert l2.rpc.call('release-htlcs') == {'released': 1}
+    l1.rpc.waitsendpay(inv['payment_hash'], timeout=60)
+    wait_for(lambda: htlcs_out() == [])
+    res = l1.rpc.xrebalance(**ask)
+    assert len(res['routes']) == 1, res
+
+
 def test_retry_stop(node_factory, bitcoind, plugin_opts):
     """A liquidity failure teaches askrene that the erring channel
     carries less than the failed amount, stored as an upper bound one

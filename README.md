@@ -65,6 +65,10 @@ retrying, and using what each attempt showed.
 - **A probability floor.**  Optionally, a part whose success
   estimate from askrene is below
   `xrebalance-min-probability-percent` is not sent.  Off by default.
+- **An HTLC slot cap.**  A channel holds at most `max_accepted_htlcs`
+  outgoing HTLCs at once (CLN's `max-concurrent-htlcs`, 30 by
+  default); parts past the free slots of their first hop are not
+  sent.
 - **Dryrun.**  A dryrun runs the same planner as execution and
   returns the plan execution would have used.
 - **Per-part notifications.**  Each part's resolution is broadcast
@@ -85,6 +89,7 @@ retrying, and using what each attempt showed.
 | a `fee_insufficient` with its channel_update blanked (some forwarders zero it for privacy)                                 | cannot tell stale gossip from an inbound fee, so temporarily excludes both candidate channels — otherwise the next plan would repeat the failure; the exclusions expire |
 | a hop return a node-level error (`temporary_node_failure`, …)                                                              | temporarily disables the node — excluding one channel would just re-route through the same node's other channels                                                        |
 | the returning HTLC offer less than the part delivered                                                                      | declines to settle it — releasing the preimage against a short HTLC would let the last-hop peer dishonestly claim the full amount upstream                              |
+| a plan put more parts on one of our channels than it has free HTLC slots                                                   | drops the parts past the free slots for the round — channeld would refuse them unsent (`temporary_channel_failure`, "Too many HTLCs"), and askrene has no slot model    |
 | no usable route at the asked amount (getroutes 205)                                                                        | descends a ladder — 3/4, 1/2, 1/4, 1/8 of the amount — and plans the first amount the network can carry; a ladder run dry ends the request                              |
 | routes only over the fee budget (getroutes 206)                                                                            | stops rather than descending: base fees weigh more at smaller amounts, so cheaper routes do not appear further down                                                     |
 
@@ -173,6 +178,19 @@ capacity rates near 100%; a low estimate comes from a hop whose
 recorded maximum is near the part's amount, set by an earlier
 liquidity failure.  Such parts sometimes succeed, and the
 liquidity they prove serves the parts that follow.
+
+Each of our channels holds at most `max_accepted_htlcs` outgoing
+HTLCs at once — CLN's `max-concurrent-htlcs`, 30 by default — and
+channeld refuses the add past that count with
+`temporary_channel_failure` ("Too many HTLCs") before the part
+leaves the node.  askrene has no slot model, so a solve that splits
+the amount into many parts can put more of them on one first-hop
+channel than it has slots.  The planner counts each channel's free
+slots when it reads the channels — the limit less the HTLCs in
+flight on it, forwards and earlier parts included — and drops the
+parts past them, in plan order.  As with the floor, nothing is
+recorded for a dropped part, and a plan left with no parts ends the
+request as when no route is found; the next round counts again.
 
 The parts of one request are **independent payments, not an MPP
 set**: each carries its own preimage, payment_hash, and secret.

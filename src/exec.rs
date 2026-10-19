@@ -732,7 +732,7 @@ pub struct ExecOutcome {
 }
 
 /// The channel half of a "scid/dir" string.
-fn scid_of(scidd: &str) -> String {
+pub(crate) fn scid_of(scidd: &str) -> String {
     scidd.split_once('/').map_or(scidd, |(s, _)| s).to_owned()
 }
 
