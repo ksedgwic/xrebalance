@@ -26,6 +26,7 @@
 //! update-only layer entry ordered before the auto.localchans add
 //! would silently suppress the channel instead).
 
+use crate::exec::scid_of;
 use anyhow::{anyhow, Error};
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
@@ -33,6 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::spec::{bound_with_unit_slack, flow_unit_msat, unit_headroom_msat};
 use crate::{State, XRebalanceParams};
 
 /// The stand-in destination node id.  Not a valid curve point; must
@@ -99,6 +101,11 @@ struct Chan {
     /// The alias the peer assigned for onions naming this channel
     /// (present and required for unannounced channels).
     onion_scid: Option<String>,
+    /// Outgoing HTLC slots left: the node's max_accepted_htlcs less
+    /// the HTLCs we have in flight on the channel, forwards and
+    /// earlier parts included.  channeld refuses the add past the
+    /// limit ("Too many HTLCs") before the part leaves.
+    free_htlc_slots: u32,
 }
 
 /// BOLT 7 direction: 0 if `from` is the lexicographically lesser id.
@@ -197,20 +204,52 @@ pub fn retries_liquidity_failures(
         })
 }
 
+/// Outgoing HTLC slots left per channel of ours this round, one taken
+/// per planned part leaving through it.
+struct HtlcSlots(HashMap<String, u32>);
+
+impl HtlcSlots {
+    /// Take a slot on `scid`; false when the channel has none left.
+    /// A channel not in the ledger is not limited here.
+    fn take(&mut self, scid: &str) -> bool {
+        match self.0.get_mut(scid) {
+            Some(0) => false,
+            Some(free) => {
+                *free -= 1;
+                true
+            }
+            None => true,
+        }
+    }
+}
+
 /// The detail string for a plan whose every part was pruned: names
 /// the one reason when there is only one, the count per reason
 /// otherwise.
-fn all_pruned_detail(n_solved: usize, long: usize, over_rate: usize, under_prob: usize) -> String {
+fn all_pruned_detail(
+    n_solved: usize,
+    long: usize,
+    over_rate: usize,
+    under_prob: usize,
+    no_slot: usize,
+) -> String {
     if over_rate == n_solved {
         return format!("all {n_solved} planned parts exceeded the fee rate cap");
     }
     if under_prob == n_solved {
         return format!("all {n_solved} planned parts were under the probability floor");
     }
+    if no_slot == n_solved {
+        return format!("all {n_solved} planned parts had no free HTLC slot on their first hop");
+    }
     let reasons: Vec<String> = [
         (long, format!("over {MAX_SAFE_HOPS} hops")),
         (over_rate, "over the fee rate cap".to_owned()),
         (under_prob, "under the probability floor".to_owned()),
+        (
+            no_slot,
+            "without a free HTLC slot on their first hop".to_owned(),
+        ),
     ]
     .into_iter()
     .filter(|(count, _)| *count > 0)
@@ -347,19 +386,30 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
     // first (worst case: every budgeted msat is spent).  The
     // destination side needs no headroom -- the last hop delivers
     // net of fees.
-    let src_movable = match (params.maxfee_msat, params.maxfee_ppm) {
-        (Some(msat), None) => src_bound.saturating_sub(msat),
+    let after_fees = |bound: u64| match (params.maxfee_msat, params.maxfee_ppm) {
+        (Some(msat), None) => bound.saturating_sub(msat),
         (None, Some(ppm)) => {
-            u64::try_from(u128::from(src_bound) * 1_000_000 / (1_000_000 + u128::from(ppm)))
+            u64::try_from(u128::from(bound) * 1_000_000 / (1_000_000 + u128::from(ppm)))
                 .expect("shrunk from a u64")
         }
         _ => unreachable!("validated by caller"),
     };
+    // The solver draws on each source in whole flow units (spec.rs,
+    // unit_headroom_msat), so the summed bounds overstate what it
+    // can draw by up to two units per source, and an ask clamped to
+    // the bare sum fails its top rung.  The unit headroom comes off
+    // the source side as well, sized from the ask before it (its
+    // unit is no smaller than the final one, so the room suffices).
+    let unit_headroom = unit_headroom_msat(
+        params.sources.len(),
+        params.amount_msat.min(after_fees(src_bound)).min(dst_bound),
+    );
+    let src_movable = after_fees(src_bound.saturating_sub(unit_headroom));
     let amount_msat = params.amount_msat.min(src_movable).min(dst_bound);
     if amount_msat < params.amount_msat {
         log::debug!(
             "req {}: amount clamped to {}msat (requested {}, sources \
-             carry {} after fee headroom, destinations carry {})",
+             carry {} after fee and unit headroom, destinations carry {})",
             params.label.as_deref().unwrap_or("?"),
             crate::eng(amount_msat),
             crate::eng(params.amount_msat),
@@ -377,9 +427,9 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
 
     if amount_msat == 0 {
         let side = if src_movable == 0 && dst_bound == 0 {
-            "sources (after fee headroom) and destinations leave"
+            "sources (after fee and unit headroom) and destinations leave"
         } else if src_movable == 0 {
-            "sources (after fee headroom) leave"
+            "sources (after fee and unit headroom) leave"
         } else {
             "destinations leave"
         };
@@ -541,6 +591,12 @@ async fn local_channels(rpc: &mut ClnRpc) -> Result<Local, Error> {
             continue;
         }
         let private = ch["private"].as_bool().unwrap_or(false);
+        let htlcs_out = ch["htlcs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|h| h["direction"].as_str() == Some("out"))
+            .count() as u64;
         usable.insert(
             scid.to_owned(),
             Chan {
@@ -554,6 +610,10 @@ async fn local_channels(rpc: &mut ClnRpc) -> Result<Local, Error> {
                 onion_scid: (private)
                     .then(|| ch["alias"]["remote"].as_str().map(str::to_owned))
                     .flatten(),
+                // Without the field the limit is unknown: no cap.
+                free_htlc_slots: ch["max_accepted_htlcs"]
+                    .as_u64()
+                    .map_or(u32::MAX, |max| max.saturating_sub(htlcs_out) as u32),
             },
         );
     }
@@ -576,6 +636,17 @@ async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
         .await?;
     }
     Ok(())
+}
+
+/// A source's drain direction and the bounds on it: `bound` is what
+/// this request may draw through it (the cap under the live
+/// spendable), `solver_max` the maximum the solver currently sees
+/// for the arc -- auto.localchans' spendable until a lower bound is
+/// written into the request layer.
+struct SourceBound {
+    scidd: String,
+    bound: u64,
+    solver_max: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -690,6 +761,9 @@ async fn plan_in_layer(
         .iter()
         .map(|s| (s.scid.as_str(), s.max_msat))
         .collect();
+    // Each source's drain direction with what this request may draw
+    // through it; the bounds are written per ladder rung below.
+    let mut src_bounds: Vec<SourceBound> = Vec::with_capacity(params.sources.len());
     for (scid, peer_id) in fence {
         call(
             rpc,
@@ -716,31 +790,14 @@ async fn plan_in_layer(
                 )
                 .await?;
             }
-            // A binding source cap is one extra max constraint on
-            // the real drain direction.  Layers intersect
-            // constraints, and the solver resolves the resulting
-            // min > max contradiction with auto.localchans' exact
-            // spendable assertion by trusting the max ("assume min
-            // is wrong", mcf.c), so the effective liquidity becomes
-            // min(cap, spendable) -- reality binds when it is the
-            // smaller.  A cap of 0 excludes the source outright.
-            // The MCF quantizes flow into ~amount/1000 units and
-            // may sit one unit past a knowledge bound, so a cap is
-            // honored to routing granularity, not to the msat.
-            Some(Some(cap)) if *cap < chans[scid].spendable_msat => {
-                call(
-                    rpc,
-                    "askrene-inform-channel",
-                    json!({
-                        "layer": split,
-                        "short_channel_id_dir": out_scidd,
-                        "amount_msat": cap + 1,
-                        "inform": "constrained",
-                    }),
-                )
-                .await?;
+            Some(cap) => {
+                let spendable = chans[scid].spendable_msat;
+                src_bounds.push(SourceBound {
+                    scidd: out_scidd,
+                    bound: cap.map_or(spendable, |cap| cap.min(spendable)),
+                    solver_max: spendable,
+                });
             }
-            Some(_) => {}
         }
     }
 
@@ -776,6 +833,50 @@ async fn plan_in_layer(
                 .expect("shrunk from a u64"),
             _ => unreachable!("validated by caller"),
         };
+        // Each source's bound for this rung: the cap under the live
+        // spendable, lowered to leave the rung's flow unit of slack
+        // for the per-part extras the solver's refine stage adds
+        // (spec.rs, bound_with_unit_slack).  The bound is one extra
+        // max constraint on the real drain direction; layers
+        // intersect constraints, and the solver resolves the min >
+        // max contradiction with auto.localchans' exact spendable
+        // assertion by trusting the max ("assume min is wrong",
+        // mcf.c).  Only a value under what the solver already sees
+        // takes effect, so each rung lowers the previous rung's
+        // value or writes nothing.  A cap of 0 excludes the source.
+        let mut written = 0usize;
+        for sb in &mut src_bounds {
+            let target = bound_with_unit_slack(sb.bound.min(sb.solver_max), rung);
+            if target >= sb.solver_max {
+                continue;
+            }
+            call(
+                rpc,
+                "askrene-inform-channel",
+                json!({
+                    "layer": split,
+                    "short_channel_id_dir": sb.scidd,
+                    "amount_msat": target + 1,
+                    "inform": "constrained",
+                }),
+            )
+            .await?;
+            sb.solver_max = target;
+            written += 1;
+        }
+        if let (true, Some(unit)) = (written > 0, flow_unit_msat(rung)) {
+            let under_cap: u64 = src_bounds
+                .iter()
+                .map(|sb| sb.bound.saturating_sub(sb.solver_max))
+                .sum();
+            log::debug!(
+                "req {}: {written} source bound(s) written for the {} msat flow unit, \
+                 {} msat under the caps in total",
+                params.label.as_deref().unwrap_or("?"),
+                crate::eng(unit),
+                crate::eng(under_cap),
+            );
+        }
         let mut getroutes = json!({
             "source": self_id,
             "destination": FAKE_US_IN,
@@ -899,6 +1000,16 @@ async fn plan_in_layer(
         * 10_000;
     let mut pruned_prob_ppm: Vec<u64> = Vec::new();
     let mut pruned_prob_msat: u64 = 0;
+    // Parts dropped for want of an HTLC slot on their first hop,
+    // counted per channel for the summary line.
+    let mut slots = HtlcSlots(
+        chans
+            .iter()
+            .map(|(scid, chan)| (scid.clone(), chan.free_htlc_slots))
+            .collect(),
+    );
+    let mut pruned_slot: HashMap<String, usize> = HashMap::new();
+    let mut pruned_slot_msat: u64 = 0;
     for mut route in solved_routes {
         normalize_hops(&mut route);
         let path = route["path"]
@@ -917,6 +1028,7 @@ async fn plan_in_layer(
         }
         let first = path.first().ok_or_else(|| anyhow!("empty path"))?;
         let route_sent = first["amount_in_msat"].as_u64().unwrap_or(0);
+        let first_scid = scid_of(first["short_channel_id_dir"].as_str().unwrap_or_default());
         let last = path.last_mut().ok_or_else(|| anyhow!("empty path"))?;
         if last["node_id_out"].as_str() != Some(FAKE_US_IN) {
             return Err(anyhow!("getroutes: route does not end at the split node"));
@@ -962,7 +1074,7 @@ async fn plan_in_layer(
         if !part_within_probability(probability_ppm, min_probability_ppm) {
             log::trace!(
                 "req {}: pruning part under the probability floor: {} msat \
-                 delivered, success probability {:>5}% (floor {}%)",
+                 delivered, {:>5}% success probability (floor {}%)",
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_delivered),
                 crate::percent(probability_ppm.unwrap_or(0)),
@@ -972,10 +1084,28 @@ async fn plan_in_layer(
             pruned_prob_msat = pruned_prob_msat.saturating_add(route_delivered);
             continue;
         }
+        // The first hop is one of our channels, and channeld refuses
+        // an add past its free HTLC slots before the part leaves.
+        // askrene has no slot model, so a many-part solve can put
+        // more parts on one channel than it has slots; the parts
+        // past them are dropped for the round, in plan order.
+        // Nothing is recorded, and the next round counts again.
+        if !slots.take(&first_scid) {
+            log::trace!(
+                "req {}: pruning part without a free HTLC slot on {}: {} msat \
+                 delivered",
+                params.label.as_deref().unwrap_or("?"),
+                first_scid,
+                crate::eng(route_delivered),
+            );
+            *pruned_slot.entry(first_scid).or_insert(0) += 1;
+            pruned_slot_msat = pruned_slot_msat.saturating_add(route_delivered);
+            continue;
+        }
         if let Some(prob) = probability_ppm {
             log::trace!(
                 "req {}: planned part: {} msat delivered ({:>6} ppm), \
-                 success probability {:>5}%",
+                 {:>5}% success probability",
                 params.label.as_deref().unwrap_or("?"),
                 crate::eng(route_delivered),
                 crate::eng(fee_ppm(route_fee, route_delivered).unwrap_or(0)),
@@ -1037,6 +1167,26 @@ async fn plan_in_layer(
             crate::percent(min_probability_ppm),
         );
     }
+    if !pruned_slot.is_empty() {
+        let mut per_chan: Vec<String> = pruned_slot
+            .iter()
+            .map(|(scid, n)| {
+                format!(
+                    "{n} on {scid} ({} free)",
+                    chans.get(scid).map_or(0, |chan| chan.free_htlc_slots)
+                )
+            })
+            .collect();
+        per_chan.sort();
+        log::debug!(
+            "req {}: pruned {} part(s) without a free HTLC slot on their first \
+             hop ({} msat foregone): {}",
+            params.label.as_deref().unwrap_or("?"),
+            pruned_slot.values().sum::<usize>(),
+            crate::eng(pruned_slot_msat),
+            per_chan.join(", "),
+        );
+    }
     let fee = sent.saturating_sub(delivered);
     // Defensive: the budget is enforced at the quote by getroutes,
     // per part above, and re-checked here post-route.
@@ -1051,6 +1201,7 @@ async fn plan_in_layer(
             pruned_long,
             pruned_rate_ppm.len(),
             pruned_prob_ppm.len(),
+            pruned_slot.values().sum(),
         ))
     } else {
         None
@@ -1071,7 +1222,7 @@ async fn plan_in_layer(
 mod tests {
     use super::{
         all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
-        part_within_rate, retries_liquidity_failures, route_path,
+        part_within_rate, retries_liquidity_failures, route_path, HtlcSlots,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -1130,27 +1281,53 @@ mod tests {
     #[test]
     fn all_pruned_detail_names_a_single_reason() {
         assert_eq!(
-            all_pruned_detail(3, 0, 3, 0),
+            all_pruned_detail(3, 0, 3, 0, 0),
             "all 3 planned parts exceeded the fee rate cap"
         );
         assert_eq!(
-            all_pruned_detail(2, 0, 0, 2),
+            all_pruned_detail(2, 0, 0, 2, 0),
             "all 2 planned parts were under the probability floor"
+        );
+        assert_eq!(
+            all_pruned_detail(4, 0, 0, 0, 4),
+            "all 4 planned parts had no free HTLC slot on their first hop"
         );
     }
 
     #[test]
     fn all_pruned_detail_counts_mixed_reasons() {
         assert_eq!(
-            all_pruned_detail(6, 1, 2, 3),
+            all_pruned_detail(6, 1, 2, 3, 0),
             "all 6 planned parts pruned: 1 over 20 hops, 2 over the fee \
              rate cap, 3 under the probability floor"
         );
         assert_eq!(
-            all_pruned_detail(4, 0, 1, 3),
+            all_pruned_detail(4, 0, 1, 3, 0),
             "all 4 planned parts pruned: 1 over the fee rate cap, 3 under \
              the probability floor"
         );
+        assert_eq!(
+            all_pruned_detail(5, 0, 2, 0, 3),
+            "all 5 planned parts pruned: 2 over the fee rate cap, 3 without \
+             a free HTLC slot on their first hop"
+        );
+    }
+
+    // One slot per part: a channel admits its free count and refuses
+    // the rest; a channel not in the ledger is not limited.
+    #[test]
+    fn slots_admit_the_free_count_then_refuse() {
+        let mut slots = HtlcSlots(HashMap::from([("1x1x1".to_owned(), 2)]));
+        assert!(slots.take("1x1x1"));
+        assert!(slots.take("1x1x1"));
+        assert!(!slots.take("1x1x1"));
+        assert!(slots.take("9x9x9"));
+    }
+
+    #[test]
+    fn a_channel_with_no_free_slot_admits_nothing() {
+        let mut slots = HtlcSlots(HashMap::from([("1x1x1".to_owned(), 0)]));
+        assert!(!slots.take("1x1x1"));
     }
 
     fn route(hops: &[&str], delivered_msat: u64) -> Value {

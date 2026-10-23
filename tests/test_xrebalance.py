@@ -138,7 +138,7 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
         r"[0-9.]+/[0-9.]+/[0-9.]+% min/median/max per part, "
         r"expected delivery [0-9.]+% of the planned amount")
     assert l1.daemon.is_in_log(
-        r"part +1/ +1 complete: .*, probability +[0-9.]+%")
+        r"part +1/ +1 complete: .*, +[0-9.]+% probability")
 
     # Success feedback: the one NETWORK hop of the route (l2 -> l3;
     # first and return hops are ours and excluded) must now carry an
@@ -223,7 +223,7 @@ def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
     # A failed part's line carries the estimate too.
     assert l1.daemon.is_in_log(
-        r"part +1/ +1 failed.*, probability +[0-9.]+%")
+        r"part +1/ +1 failed.*, +[0-9.]+% probability")
 
     # Failure feedback: the erring direction (l2 -> l3) now carries a
     # constrained record in the persistent layer.
@@ -465,6 +465,68 @@ def test_min_probability_floor(node_factory, bitcoind, plugin_opts):
         l1.rpc.xrebalance(**ask, min_probability_percent=101)
 
 
+def test_first_hop_slot_cap(node_factory, bitcoind, plugin_opts, hold_htlcs):
+    """A channel holds at most max_accepted_htlcs outgoing HTLCs at
+    once; channeld refuses the next add with "Too many HTLCs" before
+    the part leaves.  The planner counts the free slots per first hop
+    and drops the parts past them: a part on a channel whose slots
+    are all in flight is not planned, and is again once one frees.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{**plugin_opts, 'max-concurrent-htlcs': 1},
+              {'plugin': hold_htlcs}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    chan12 = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
+    assert chan12['max_accepted_htlcs'] == 1, chan12
+    src = chan12['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    ask = dict(sources=[src], destinations=[scid_fill],
+               amount_msat=100_000, maxfee_msat=5_000, dryrun=True)
+
+    def htlcs_out():
+        return [h['direction'] for h in only_one(
+            l1.rpc.listpeerchannels(l2.info['id'])['channels'])['htlcs']]
+
+    # The one slot is free: the part is planned.
+    res = l1.rpc.xrebalance(**ask)
+    assert len(res['routes']) == 1, res
+
+    # A payment l2 holds takes the slot ...
+    inv = l2.rpc.invoice(1_000, 'hold', 'hold')
+    hop = {'id': l2.info['id'], 'channel': src,
+           'direction': int(l1.info['id'] > l2.info['id']),
+           'amount_msat': 1_000,
+           'delay': l2.rpc.listconfigs('cltv-final')['configs']
+           ['cltv-final']['value_int']}
+    l1.rpc.sendpay([hop], inv['payment_hash'],
+                   payment_secret=inv['payment_secret'])
+    wait_for(lambda: htlcs_out() == ['out'])
+
+    # ... and the plan drops the part rather than send it to be
+    # refused.
+    res = l1.rpc.xrebalance(**ask)
+    assert res['routes'] == [], res
+    assert res['delivered_msat'] == 0, res
+    assert res['detail'] == (
+        'all 1 planned parts had no free HTLC slot on their first hop'), res
+    assert l1.daemon.is_in_log(
+        r"pruned 1 part\(s\) without a free HTLC slot on their first hop "
+        r"\(100_000 msat foregone\): 1 on " + src + r" \(0 free\)")
+
+    # Released, the slot frees and the part is planned again.  (l2
+    # takes hold only once the HTLC is committed on its side, after
+    # l1 already lists it.)
+    l2.daemon.wait_for_log('holding htlc')
+    assert l2.rpc.call('release-htlcs') == {'released': 1}
+    l1.rpc.waitsendpay(inv['payment_hash'], timeout=60)
+    wait_for(lambda: htlcs_out() == [])
+    res = l1.rpc.xrebalance(**ask)
+    assert len(res['routes']) == 1, res
+
+
 def test_retry_stop(node_factory, bitcoind, plugin_opts):
     """A liquidity failure teaches askrene that the erring channel
     carries less than the failed amount, stored as an upper bound one
@@ -522,7 +584,7 @@ def test_retry_stop(node_factory, bitcoind, plugin_opts):
     assert res['delivered_msat'] == 0, res
     # The estimate never saw the shave: the known channel scores 1.
     assert l1.daemon.is_in_log(
-        r"req shave: part +1/ +1 failed.*probability 100.0%")
+        r"req shave: part +1/ +1 failed.*, 100.0% probability")
     l1.daemon.wait_for_log(
         r"req shave: finished after 1 round\(s\): stalled: every planned "
         r"part retries a route")
@@ -636,3 +698,81 @@ def test_fence_covers_spliced_channel(node_factory, bitcoind, plugin_opts):
         first = route['path'][0]['short_channel_id_dir']
         assert first.startswith(src), res
         assert not first.startswith(scid_direct), res
+
+
+def test_source_bound_leaves_room_for_part_extras(node_factory, bitcoind,
+                                                  plugin_opts):
+    """askrene packs a source in flow units (about a thousandth of the
+    ask) up to the bound it sees.  Its refine stage then reserves, per
+    part, the delivered amount plus downstream fees plus a
+    commitment-fee extra on channels this node opened, against the
+    same bound, and when a part came up short of its flow it grows the
+    others into the room it finds.  A bound that is a whole number of
+    units leaves no room for the extras: every part on the source is
+    over capacity, refine logs one BROKEN line per part per pass, and
+    the solve repeats.  The planner writes each source bound one msat
+    short of a unit multiple, so a whole unit is left for them, and
+    takes the units the packing can lose off the clamp so the top rung
+    stays feasible.
+
+    l1 -> l2 is the only source (l1 opened it).  l2 -> l3 and
+    l2 -> l4 -> l3 are each too thin for the ask alone, so the solve
+    splits into two parts through the source.  l2 -> l3 carries an
+    htlc_max just over a unit multiple and under l3's fee on the part,
+    so the flow builder fills it to the unit, refine shortens that part
+    by the fee and grows the other: the path on which the source bound
+    is checked.  The fee budget sits close over the fees, so the room
+    it leaves on the source is no cover for the extras (645_000 msat a
+    part at the regtest feerate).
+    """
+    l1, l2, l3, l4 = node_factory.get_nodes(
+        4, opts=[plugin_opts, {}, {'fee-base': 0, 'fee-per-satoshi': 100}, {}])
+    node_factory.join_nodes([l1, l2], fundamount=5_000_000,
+                            wait_for_announce=True)
+    node_factory.join_nodes([l2, l4], fundamount=3_000_000,
+                            wait_for_announce=True)
+    scid23, _ = l2.fundchannel(l3, 3_000_000, wait_for_active=True)
+    scid43, _ = l4.fundchannel(l3, 3_000_000, wait_for_active=True)
+    scid_fill, _ = l3.fundchannel(l1, 5_000_000, announce_channel=False)
+    bitcoind.generate_block(6)
+    scid24 = only_one(
+        l2.rpc.listpeerchannels(l4.info['id'])['channels'])['short_channel_id']
+    for scid in (scid23, scid43, scid24):
+        wait_for(lambda: len(l1.rpc.listchannels(scid)['channels']) == 2)
+
+    # The cap less the fee budget is 4 G, a whole number of flow units
+    # of 4 M; the clamp takes the budget and 2n + 1 = 3 units off it.
+    fee = 600_000
+    cap = 4_000_000_000 + fee
+    effective = cap - fee - 3 * -(-(cap - fee) // 1000)
+    unit = -(-effective // 1000)
+    htlc_max = 376 * unit + 100_000
+    l2.rpc.setchannel(scid23, htlcmax=htlc_max)
+    wait_for(lambda: only_one([
+        h for h in l1.rpc.listchannels(scid23)['channels']
+        if h['source'] == l2.info['id']])['htlc_maximum_msat'] == htlc_max)
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+
+    res = l1.rpc.xrebalance(sources=[{'scid': src, 'max_msat': cap}],
+                            destinations=[scid_fill],
+                            amount_msat=cap, maxfee_msat=fee, dryrun=True)
+    assert res['status'] == 'planned', res
+    # Every part fit its bound in refine: no overshoot was logged
+    # (pyln also fails the test on any BROKEN line at teardown).
+    assert not l1.daemon.is_in_log(
+        r'increase_flows: flow .* more than the path')
+    # The top rung routes at the clamped amount (no ladder descent).
+    assert res['effective_amount_msat'] == effective, res
+    assert l1.daemon.is_in_log(r'1 source bound\(s\) written for the')
+    assert len(res['routes']) == 2, res
+    # The l2 -> l3 part was shortened under its packed units and the
+    # other grew to the full amount, within the bound.
+    short = only_one([r for r in res['routes']
+                      if r['path'][1]['short_channel_id_dir'].startswith(scid23 + '/')])
+    assert short['path'][-1]['amount_out_msat'] < 376 * unit, short
+    assert res['delivered_msat'] == effective, res
+    crossing = sum(r['path'][0]['amount_in_msat'] for r in res['routes'])
+    assert crossing <= cap, (crossing, res)
