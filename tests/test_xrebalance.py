@@ -42,6 +42,10 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
         source=l2.info['id'])['channels']
         if c['destination'] == l3.info['id']])
 
+    # The persistent layer is created by the first request; before
+    # that the stats command reports it as absent.
+    assert l1.rpc.call('xrebalance-stats')['layer'] == {'exists': False}
+
     # DRYRUN: plan only.
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
                             amount_msat=100000, maxfee_msat=5000,

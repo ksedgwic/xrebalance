@@ -751,14 +751,19 @@ async fn xrebalance_stats(
     let mut rpc = cln_rpc::ClnRpc::new(&state.rpc_path)
         .await
         .map_err(|e| anyhow!("connecting to lightningd rpc: {e}"))?;
+    // List every layer and pick ours by name: asking for a layer
+    // that does not exist is an error, and ours does not exist until
+    // the first request creates it.
     let listed = rpc
-        .call_raw::<serde_json::Value, serde_json::Value>(
-            "askrene-listlayers",
-            &json!({"layer": plan::PERSISTENT_LAYER}),
-        )
+        .call_raw::<serde_json::Value, serde_json::Value>("askrene-listlayers", &json!({}))
         .await
         .map_err(|e| anyhow!("askrene-listlayers: {e}"))?;
-    let layer = match listed["layers"].as_array().and_then(|l| l.first()) {
+    let ours = listed["layers"].as_array().and_then(|layers| {
+        layers
+            .iter()
+            .find(|l| l["layer"].as_str() == Some(plan::PERSISTENT_LAYER))
+    });
+    let layer = match ours {
         None => json!({"exists": false}),
         Some(l) => {
             let constraints = l["constraints"].as_array().cloned().unwrap_or_default();
