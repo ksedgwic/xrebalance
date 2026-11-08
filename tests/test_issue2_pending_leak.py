@@ -22,10 +22,6 @@ from pathlib import Path
 HOLD_FAIL = Path(__file__).parent / "plugins" / "hold_fail_htlcs.py"
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="ksedgwic/xrebalance#2: a detached part that "
-                          "fails stays reserved as pending for the rest "
-                          "of the request; remove this marker with the fix")
 def test_issue2_failed_detached_part_stays_pending(node_factory, bitcoind,
                                                    plugin_opts):
     l1, l2, l3 = node_factory.line_graph(

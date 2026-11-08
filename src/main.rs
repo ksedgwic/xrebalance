@@ -224,6 +224,10 @@ pub struct State {
     pub feedback_writes: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Terminal outcomes of parts that detached to background_watch,
+    /// keyed by payment_hash; the owning request reconciles them into
+    /// its pending/committed accounting (issue #2).
+    pub detached_outcomes: Arc<Mutex<HashMap<String, exec::DetachedOutcomeRecord>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
     pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
     /// Learned gossip overrides, applied per request (overrides.rs).
@@ -386,6 +390,7 @@ async fn run() -> Result<(), Error> {
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
+        detached_outcomes: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
         overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
@@ -530,8 +535,77 @@ async fn xrebalance(
     let fragment_msat = state.min_part_msat.load(Ordering::Relaxed).max(1);
     let mut round: u64 = 0;
     let stop_reason: String;
+    // The detached parts this request is still waiting on (issue #2):
+    // their watchers write terminal outcomes to the shared record, and
+    // each round reconciles them so a failure releases its reservation
+    // instead of sitting as pending to the end of the request.
+    let mut detached_known: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut detached_failed: u64 = 0;
+
+    // Fold terminal outcomes of this request's detached parts into the
+    // running totals; called at the top of each round and once more
+    // before the response is rendered, so the pending fields report
+    // only what is still in flight.
+    fn reconcile_detached(
+        state: &State,
+        known: &mut std::collections::HashSet<String>,
+        pending: &mut u64,
+        pending_fee: &mut u64,
+        delivered: &mut u64,
+        fee: &mut u64,
+        failed_count: &mut u64,
+        source_committed: &mut HashMap<String, u64>,
+        dest_committed: &mut HashMap<String, u64>,
+        req: &str,
+    ) {
+        let mut records = state
+            .detached_outcomes
+            .lock()
+            .expect("detached outcomes lock");
+        let done: Vec<String> = known
+            .iter()
+            .filter(|h| records.contains_key(*h))
+            .cloned()
+            .collect();
+        for hash in done {
+            let rec = records.remove(&hash).expect("checked present");
+            known.remove(&hash);
+            *pending = pending.saturating_sub(rec.planned_msat);
+            *pending_fee = pending_fee
+                .saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
+            let src = source_committed.entry(rec.source_scid.clone()).or_default();
+            *src = src.saturating_sub(rec.planned_sent_msat);
+            let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
+            *dst = dst.saturating_sub(rec.planned_msat);
+            if rec.failed {
+                *failed_count += 1;
+            } else {
+                *delivered += rec.planned_msat;
+                *fee += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
+            }
+            log::debug!(
+                "req {req}: detached part {hash} reached terminal state: \
+                 pending now {} msat",
+                eng(*pending)
+            );
+        }
+    }
+
     loop {
         round += 1;
+        reconcile_detached(
+            state,
+            &mut detached_known,
+            &mut pending_total,
+            &mut pending_fee_total,
+            &mut delivered_total,
+            &mut fee_total,
+            &mut detached_failed,
+            &mut source_committed,
+            &mut dest_committed,
+            &req,
+        );
         // Amounts still in flight count as committed: if a straggler
         // later fails, this request under-delivers rather than
         // double-spending its liquidity on a retry.
@@ -612,6 +686,9 @@ async fn xrebalance(
             *dest_committed.entry(scid.clone()).or_default() += *msat;
         }
         liquidity_failed.extend(outcome.liquidity_failed);
+        for hash in &outcome.detached {
+            detached_known.insert(hash.clone());
+        }
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
@@ -658,7 +735,30 @@ async fn xrebalance(
         "req {req}: finished after {} round(s): {stop_reason}",
         rounds.len()
     );
-    let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
+    // Once more, so a failure that landed after the last round is not
+    // reported as pending in the response (issue #2).
+    reconcile_detached(
+        state,
+        &mut detached_known,
+        &mut pending_total,
+        &mut pending_fee_total,
+        &mut delivered_total,
+        &mut fee_total,
+        &mut detached_failed,
+        &mut source_committed,
+        &mut dest_committed,
+        &req,
+    );
+    let mut summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
+    // The pending fields render from the reconciled record: the parts
+    // still pending at response time are exactly this request's
+    // detached parts without a terminal outcome yet.
+    summary["parts_pending"] = json!(detached_known.len());
+    summary["pending_msat"] = json!(pending_total);
+    if detached_failed > 0 {
+        let failed = summary["parts_failed"].as_u64().unwrap_or(0) + detached_failed;
+        summary["parts_failed"] = json!(failed);
+    }
     let mut response = serde_json::json!({
         "status": "executed",
         "label": parsed.label,
