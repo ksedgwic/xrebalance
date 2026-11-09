@@ -233,6 +233,10 @@ refreshes, node disables, channel exclusions; `claims` counts parts
 still in flight; `coalescer_entries` counts the cache that
 suppresses redundant layer writes.
 
+The plugin creates the layer on the first request that has an amount
+to move.  While the layer does not exist, the `layer` block is
+`{"exists": false}`.
+
 Run it after a request, or when a plan looks wrong, to see what the
 layer has learned and how old that knowledge is.  `channel_updates`,
 `disabled_nodes`, and `created_channels` in the layer block belong
