@@ -28,6 +28,18 @@ def pytest_configure(config):
 def xrebalance_plugin():
     if not PLUGIN.exists():
         pytest.fail(f"{PLUGIN} missing; run `cargo build` first")
+    # Stale-binary guard: a global cargo target-dir redirect makes
+    # `cargo build` land in the shared store while these tests read
+    # THIS path — a silently stale plugin turns every assertion into a
+    # test of yesterday's code (observed 2026-11-10: the review-fix
+    # suite ran green against a binary predating the fix).
+    src_dir = PLUGIN.parents[2] / "src"
+    newest_src = max(p.stat().st_mtime for p in src_dir.glob("*.rs"))
+    if PLUGIN.stat().st_mtime < newest_src:
+        pytest.fail(
+            f"{PLUGIN} is older than src/*.rs — stale binary. Build with "
+            f"CARGO_TARGET_DIR pointing at the repo (or copy the fresh "
+            f"build from the shared store) and re-run.")
     return str(PLUGIN)
 
 
