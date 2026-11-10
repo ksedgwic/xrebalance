@@ -539,9 +539,12 @@ async fn xrebalance(
     // their watchers write terminal outcomes to the shared record, and
     // each round reconciles them so a failure releases its reservation
     // instead of sitting as pending to the end of the request.
-    let mut detached_known: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut detached_known: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut detached_failed: u64 = 0;
+    // Reconciled successes: counted into parts_complete at render time,
+    // the same way detached_failed folds into parts_failed (the saved
+    // round still says "pending" for a part that completes late).
+    let mut detached_complete: u64 = 0;
 
     // Fold terminal outcomes of this request's detached parts into the
     // running totals; called at the top of each round and once more
@@ -555,6 +558,7 @@ async fn xrebalance(
         delivered: &mut u64,
         fee: &mut u64,
         failed_count: &mut u64,
+        complete_count: &mut u64,
         source_committed: &mut HashMap<String, u64>,
         dest_committed: &mut HashMap<String, u64>,
         req: &str,
@@ -572,17 +576,24 @@ async fn xrebalance(
             let rec = records.remove(&hash).expect("checked present");
             known.remove(&hash);
             *pending = pending.saturating_sub(rec.planned_msat);
-            *pending_fee = pending_fee
-                .saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
-            let src = source_committed.entry(rec.source_scid.clone()).or_default();
-            *src = src.saturating_sub(rec.planned_sent_msat);
-            let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
-            *dst = dst.saturating_sub(rec.planned_msat);
+            *pending_fee =
+                pending_fee.saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
+            // Only a failure gives the reservation back.  A part that
+            // completed has permanently consumed its share of the
+            // per-channel caps for this request: the cap bounds the
+            // whole request, not each round, so releasing a success
+            // would let draw_down re-grant that allowance to a later
+            // round and push a channel past its max_msat.
             if rec.failed {
+                let src = source_committed.entry(rec.source_scid.clone()).or_default();
+                *src = src.saturating_sub(rec.planned_sent_msat);
+                let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
+                *dst = dst.saturating_sub(rec.planned_msat);
                 *failed_count += 1;
             } else {
                 *delivered += rec.planned_msat;
                 *fee += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
+                *complete_count += 1;
             }
             log::debug!(
                 "req {req}: detached part {hash} reached terminal state: \
@@ -602,6 +613,7 @@ async fn xrebalance(
             &mut delivered_total,
             &mut fee_total,
             &mut detached_failed,
+            &mut detached_complete,
             &mut source_committed,
             &mut dest_committed,
             &req,
@@ -745,6 +757,7 @@ async fn xrebalance(
         &mut delivered_total,
         &mut fee_total,
         &mut detached_failed,
+        &mut detached_complete,
         &mut source_committed,
         &mut dest_committed,
         &req,
@@ -758,6 +771,10 @@ async fn xrebalance(
     if detached_failed > 0 {
         let failed = summary["parts_failed"].as_u64().unwrap_or(0) + detached_failed;
         summary["parts_failed"] = json!(failed);
+    }
+    if detached_complete > 0 {
+        let complete = summary["parts_complete"].as_u64().unwrap_or(0) + detached_complete;
+        summary["parts_complete"] = json!(complete);
     }
     let mut response = serde_json::json!({
         "status": "executed",
