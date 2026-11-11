@@ -45,6 +45,10 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     # The persistent layer is created by the first request; before
     # that the stats command reports it as absent.
     assert l1.rpc.call('xrebalance-stats')['layer'] == {'exists': False}
+    # The plugin logged the same at its start.
+    wait_for(lambda: l1.daemon.is_in_log(
+        r'stats: layer absent; overrides exclusions=0 channel_updates=0 '
+        r'disabled_nodes=0; feedback_writes=0'))
 
     # DRYRUN: plan only.
     res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
@@ -184,6 +188,7 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert stats['claims'] == 0, stats
     assert stats['layer']['dirs_with_min'] >= 1, stats
     assert stats['layer']['depth_max'] >= 1, stats
+    assert stats['feedback_writes'] >= 1, stats
 
 
 def test_failure_feedback(node_factory, bitcoind, plugin_opts):

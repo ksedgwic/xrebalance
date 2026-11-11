@@ -320,7 +320,7 @@ fn normalize_hops(route: &mut Value) {
     }
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
