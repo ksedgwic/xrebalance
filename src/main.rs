@@ -19,10 +19,11 @@ use cln_plugin::options::{self, DefaultIntegerConfigOption};
 use cln_plugin::{messages, Builder, Error, Plugin};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 /// Learned constraints in the persistent xrebalance layer expire
 /// after this many seconds.  Applied lazily before each request (and
@@ -404,6 +405,7 @@ async fn run() -> Result<(), Error> {
         eng(max_rounds),
         final_cltv,
     );
+    tokio::spawn(log_stats_hourly(plugin.state().clone()));
     plugin.join().await
 }
 
@@ -732,6 +734,148 @@ fn summarize_rounds(
     summary
 }
 
+/// Our persistent layer as askrene-listlayers reports it; None
+/// until the first request creates it.
+async fn persistent_layer(rpc_path: &Path) -> Result<Option<serde_json::Value>, Error> {
+    let mut rpc = cln_rpc::ClnRpc::new(rpc_path)
+        .await
+        .map_err(|e| anyhow!("connecting to lightningd rpc: {e}"))?;
+    // List every layer and pick ours by name: asking for a layer
+    // that does not exist is an error, and ours does not exist until
+    // the first request creates it.
+    let mut listed = rpc
+        .call_raw::<serde_json::Value, serde_json::Value>("askrene-listlayers", &json!({}))
+        .await
+        .map_err(|e| anyhow!("askrene-listlayers: {e}"))?;
+    Ok(listed["layers"].as_array_mut().and_then(|layers| {
+        layers
+            .iter()
+            .position(|l| l["layer"].as_str() == Some(plan::PERSISTENT_LAYER))
+            .map(|i| layers.swap_remove(i))
+    }))
+}
+
+fn constraints_of(layer: &serde_json::Value) -> &[serde_json::Value] {
+    layer["constraints"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// Counts over the persistent layer's constraints, shared by the
+/// stats command and the stats log line.
+struct LayerCounts {
+    constraints: usize,
+    minimums: usize,
+    /// Distinct directions with a max-bound (one askrene can
+    /// short-circuit at plan time) and with a min-bound.
+    dirs_with_max: usize,
+    dirs_with_min: usize,
+    /// Entries stacked per direction, ascending.  Its length is the
+    /// number of distinct directions.
+    depths: Vec<u64>,
+    oldest: Option<u64>,
+    newest: Option<u64>,
+}
+
+fn layer_counts(constraints: &[serde_json::Value]) -> LayerCounts {
+    let mut depth: HashMap<&str, u64> = HashMap::new();
+    let mut dirs_with_max: HashSet<&str> = HashSet::new();
+    let mut dirs_with_min: HashSet<&str> = HashSet::new();
+    for c in constraints {
+        let Some(d) = c["short_channel_id_dir"].as_str() else {
+            continue;
+        };
+        *depth.entry(d).or_insert(0) += 1;
+        if c["maximum_msat"].is_u64() {
+            dirs_with_max.insert(d);
+        }
+        if c["minimum_msat"].is_u64() {
+            dirs_with_min.insert(d);
+        }
+    }
+    let mut depths: Vec<u64> = depth.values().copied().collect();
+    depths.sort_unstable();
+    let timestamps = || constraints.iter().filter_map(|c| c["timestamp"].as_u64());
+    LayerCounts {
+        constraints: constraints.len(),
+        minimums: constraints
+            .iter()
+            .filter(|c| c["minimum_msat"].is_u64())
+            .count(),
+        dirs_with_max: dirs_with_max.len(),
+        dirs_with_min: dirs_with_min.len(),
+        depths,
+        oldest: timestamps().min(),
+        newest: timestamps().max(),
+    }
+}
+
+/// The stats log line: the layer and override counts, each under
+/// the name xrebalance-stats reports it by.  The two ages are in
+/// seconds before `now`.
+fn stats_line(
+    layer: Option<&LayerCounts>,
+    now: u64,
+    constraint_age: u64,
+    (channel_updates, disabled_nodes, exclusions): (usize, usize, usize),
+    feedback_writes: u64,
+) -> String {
+    let layer = match layer {
+        None => "absent".to_owned(),
+        Some(c) => {
+            let ages = match (c.oldest, c.newest) {
+                (Some(oldest), Some(newest)) => format!(
+                    " oldest_constraint_age={} newest_constraint_age={}",
+                    now.saturating_sub(oldest),
+                    now.saturating_sub(newest),
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "constraints={} constraint_scidds={} dirs_with_max={} dirs_with_min={}{ages} \
+                 constraint_age={constraint_age}",
+                c.constraints,
+                c.depths.len(),
+                c.dirs_with_max,
+                c.dirs_with_min,
+            )
+        }
+    };
+    format!(
+        "stats: layer {layer}; overrides exclusions={exclusions} \
+         channel_updates={channel_updates} disabled_nodes={disabled_nodes}; \
+         feedback_writes={feedback_writes}"
+    )
+}
+
+/// Seconds from `now` to the next full hour of the clock, 1 to 3600.
+fn secs_until_next_hour(now: u64) -> u64 {
+    3600 - now % 3600
+}
+
+/// Write the stats line at start and on every full hour: the log
+/// then holds a history of the counts, which the stats command
+/// reports only for the moment it is called.
+async fn log_stats_hourly(state: State) {
+    loop {
+        match persistent_layer(&state.rpc_path).await {
+            Ok(layer) => {
+                let counts = layer.as_ref().map(|l| layer_counts(constraints_of(l)));
+                log::debug!(
+                    "{}",
+                    stats_line(
+                        counts.as_ref(),
+                        plan::now_secs(),
+                        state.constraint_age.load(Ordering::Relaxed),
+                        state.overrides.lock().expect("overrides lock").counts(),
+                        state.feedback_writes.load(Ordering::Relaxed),
+                    )
+                );
+            }
+            Err(e) => log::debug!("stats: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(secs_until_next_hour(plan::now_secs()))).await;
+    }
+}
+
 /// Report the plugin's state in one place: what the persistent
 /// layer holds (constraints should be the ONLY population; nonzero
 /// channel_updates / disabled_nodes / created_channels there would
@@ -748,77 +892,33 @@ async fn xrebalance_stats(
     let (policies, disabled_nodes, exclusions) =
         state.overrides.lock().expect("overrides lock").counts();
 
-    let mut rpc = cln_rpc::ClnRpc::new(&state.rpc_path)
-        .await
-        .map_err(|e| anyhow!("connecting to lightningd rpc: {e}"))?;
-    // List every layer and pick ours by name: asking for a layer
-    // that does not exist is an error, and ours does not exist until
-    // the first request creates it.
-    let listed = rpc
-        .call_raw::<serde_json::Value, serde_json::Value>("askrene-listlayers", &json!({}))
-        .await
-        .map_err(|e| anyhow!("askrene-listlayers: {e}"))?;
-    let ours = listed["layers"].as_array().and_then(|layers| {
-        layers
-            .iter()
-            .find(|l| l["layer"].as_str() == Some(plan::PERSISTENT_LAYER))
-    });
-    let layer = match ours {
+    let layer = match persistent_layer(&state.rpc_path).await? {
         None => json!({"exists": false}),
         Some(l) => {
-            let constraints = l["constraints"].as_array().cloned().unwrap_or_default();
-            let minimums = constraints
-                .iter()
-                .filter(|c| c["minimum_msat"].is_u64())
-                .count();
-            // Breadth: distinct directions, split by bound kind
-            // (a direction with a max-bound is one askrene can
-            // short-circuit at plan time).  Depth: entries stacked
-            // per direction.
-            let mut depth: HashMap<&str, u64> = HashMap::new();
-            let mut dirs_with_max: std::collections::HashSet<&str> = Default::default();
-            let mut dirs_with_min: std::collections::HashSet<&str> = Default::default();
-            for c in &constraints {
-                let Some(d) = c["short_channel_id_dir"].as_str() else {
-                    continue;
-                };
-                *depth.entry(d).or_insert(0) += 1;
-                if c["maximum_msat"].is_u64() {
-                    dirs_with_max.insert(d);
-                }
-                if c["minimum_msat"].is_u64() {
-                    dirs_with_min.insert(d);
-                }
-            }
-            let mut depths: Vec<u64> = depth.values().copied().collect();
-            depths.sort_unstable();
+            let counts = layer_counts(constraints_of(&l));
             // Nearest-rank percentile, as the contrib layer-summary
             // script computes it.
             let pct = |q: f64| -> u64 {
-                match depths.len() {
+                match counts.depths.len() {
                     0 => 0,
-                    n => depths[(q * (n - 1) as f64).round() as usize],
+                    n => counts.depths[(q * (n - 1) as f64).round() as usize],
                 }
             };
-            let timestamps: Vec<u64> = constraints
-                .iter()
-                .filter_map(|c| c["timestamp"].as_u64())
-                .collect();
             let count = |key: &str| l[key].as_array().map(|a| a.len()).unwrap_or(0);
             json!({
                 "exists": true,
-                "constraints": constraints.len(),
-                "constraint_minimums": minimums,
-                "constraint_maximums": constraints.len() - minimums,
-                "constraint_scidds": depth.len(),
-                "dirs_with_max": dirs_with_max.len(),
-                "dirs_with_min": dirs_with_min.len(),
-                "depth_min": depths.first().copied().unwrap_or(0),
+                "constraints": counts.constraints,
+                "constraint_minimums": counts.minimums,
+                "constraint_maximums": counts.constraints - counts.minimums,
+                "constraint_scidds": counts.depths.len(),
+                "dirs_with_max": counts.dirs_with_max,
+                "dirs_with_min": counts.dirs_with_min,
+                "depth_min": counts.depths.first().copied().unwrap_or(0),
                 "depth_median": pct(0.5),
                 "depth_p90": pct(0.9),
-                "depth_max": depths.last().copied().unwrap_or(0),
-                "oldest_constraint": timestamps.iter().min(),
-                "newest_constraint": timestamps.iter().max(),
+                "depth_max": counts.depths.last().copied().unwrap_or(0),
+                "oldest_constraint": counts.oldest,
+                "newest_constraint": counts.newest,
                 "channel_updates": count("channel_updates"),
                 "disabled_nodes": count("disabled_nodes"),
                 "created_channels": count("created_channels"),
@@ -844,6 +944,7 @@ async fn xrebalance_stats(
         },
         "claims": claims,
         "coalescer_entries": coalescer,
+        "feedback_writes": state.feedback_writes.load(Ordering::Relaxed),
         "overrides": {
             "channel_updates": policies,
             "disabled_nodes": disabled_nodes,
@@ -1007,7 +1108,8 @@ async fn htlc_accepted(
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_down, eng, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict,
+        draw_down, eng, layer_counts, percent, secs_until_next_hour, spec::ChanSpec, stats_line,
+        summarize_rounds, try_claim, Claim, ClaimVerdict,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1215,5 +1317,61 @@ mod tests {
         let mut claims = one_claim(1000);
         let v = htlc(&"bb".repeat(32), &secret(), 1000);
         assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+    }
+
+    #[test]
+    fn layer_counts_split_directions_by_bound() {
+        let constraints = [
+            json!({"short_channel_id_dir": "1x1x1/0", "maximum_msat": 5, "timestamp": 100}),
+            json!({"short_channel_id_dir": "1x1x1/0", "maximum_msat": 4, "timestamp": 130}),
+            json!({"short_channel_id_dir": "1x1x1/0", "minimum_msat": 2, "timestamp": 110}),
+            json!({"short_channel_id_dir": "2x2x2/1", "minimum_msat": 9, "timestamp": 120}),
+        ];
+        let counts = layer_counts(&constraints);
+        assert_eq!(counts.constraints, 4);
+        assert_eq!(counts.minimums, 2);
+        assert_eq!(counts.dirs_with_max, 1);
+        assert_eq!(counts.dirs_with_min, 2);
+        assert_eq!(counts.depths, vec![1, 3]);
+        assert_eq!((counts.oldest, counts.newest), (Some(100), Some(130)));
+
+        let empty = layer_counts(&[]);
+        assert_eq!(empty.constraints, 0);
+        assert!(empty.depths.is_empty());
+        assert_eq!((empty.oldest, empty.newest), (None, None));
+    }
+
+    #[test]
+    fn stats_line_names_the_counts_as_the_stats_command_does() {
+        let constraints = [
+            json!({"short_channel_id_dir": "1x1x1/0", "maximum_msat": 5, "timestamp": 100}),
+            json!({"short_channel_id_dir": "2x2x2/1", "minimum_msat": 9, "timestamp": 120}),
+        ];
+        let counts = layer_counts(&constraints);
+        assert_eq!(
+            stats_line(Some(&counts), 150, 21600, (3, 1, 7), 42),
+            "stats: layer constraints=2 constraint_scidds=2 dirs_with_max=1 dirs_with_min=1 \
+             oldest_constraint_age=50 newest_constraint_age=30 constraint_age=21600; \
+             overrides exclusions=7 channel_updates=3 disabled_nodes=1; feedback_writes=42",
+        );
+        // An empty layer has no ages to report.
+        assert_eq!(
+            stats_line(Some(&layer_counts(&[])), 150, 21600, (0, 0, 0), 0),
+            "stats: layer constraints=0 constraint_scidds=0 dirs_with_max=0 dirs_with_min=0 \
+             constraint_age=21600; \
+             overrides exclusions=0 channel_updates=0 disabled_nodes=0; feedback_writes=0",
+        );
+        assert_eq!(
+            stats_line(None, 150, 21600, (0, 0, 0), 0),
+            "stats: layer absent; \
+             overrides exclusions=0 channel_updates=0 disabled_nodes=0; feedback_writes=0",
+        );
+    }
+
+    #[test]
+    fn next_hour_is_at_most_an_hour_away() {
+        assert_eq!(secs_until_next_hour(7200), 3600);
+        assert_eq!(secs_until_next_hour(7201), 3599);
+        assert_eq!(secs_until_next_hour(10799), 1);
     }
 }

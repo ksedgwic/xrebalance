@@ -231,7 +231,8 @@ direction, and the timestamps of the oldest and newest.  The
 `overrides` block counts the short-lived learned overrides — policy
 refreshes, node disables, channel exclusions; `claims` counts parts
 still in flight; `coalescer_entries` counts the cache that
-suppresses redundant layer writes.
+suppresses redundant layer writes; `feedback_writes` counts the
+writes of learned state since the plugin started.
 
 The plugin creates the layer on the first request that has an amount
 to move.  While the layer does not exist, the `layer` block is
@@ -243,6 +244,18 @@ layer has learned and how old that knowledge is.  `channel_updates`,
 to the per-request layers and should read zero in the persistent
 one.  The full layer contents are available from `lightning-cli
 askrene-listlayers layer=xrebalance`.
+
+The command reports the counts for the moment it is called.  For a
+history, the plugin writes one line to the log, at debug level, when
+it starts and on every full hour:
+
+    stats: layer constraints=5200 constraint_scidds=1800 dirs_with_max=1200 dirs_with_min=700 oldest_constraint_age=21540 newest_constraint_age=12 constraint_age=21600; overrides exclusions=30 channel_updates=2 disabled_nodes=0; feedback_writes=48000
+
+The names are those of `xrebalance-stats`.  The two ages are in
+seconds.  `constraint_age` is the option value in effect.  The
+difference in `feedback_writes` between two lines is the number of
+writes in that hour.  While the layer does not exist the line reads
+`stats: layer absent; ...`.
 
 ## Configuration
 
