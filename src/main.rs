@@ -224,6 +224,10 @@ pub struct State {
     pub feedback_writes: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Terminal outcomes of parts that detached to background_watch,
+    /// keyed by payment_hash; the owning request reconciles them into
+    /// its pending/committed accounting (issue #2).
+    pub detached_outcomes: Arc<Mutex<HashMap<String, exec::DetachedOutcomeRecord>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
     pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
     /// Learned gossip overrides, applied per request (overrides.rs).
@@ -386,6 +390,7 @@ async fn run() -> Result<(), Error> {
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
+        detached_outcomes: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
         overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
@@ -416,6 +421,49 @@ fn draw_down(specs: &mut [spec::ChanSpec], committed: &HashMap<String, u64>) {
         if let (Some(cap), Some(used)) = (s.max_msat, committed.get(&s.scid)) {
             s.max_msat = Some(cap.saturating_sub(*used));
         }
+    }
+}
+
+/// Fold one terminal detached-part record into the request's running
+/// totals.  Only a failure gives the reservation back: a part that
+/// completed has permanently consumed its share of the per-channel
+/// caps for this request -- the cap bounds the whole request, not
+/// each round, so releasing a success would let draw_down re-grant
+/// that allowance to a later round and push a channel past its
+/// max_msat.
+fn fold_record(
+    rec: &exec::DetachedOutcomeRecord,
+    pending: &mut u64,
+    pending_fee: &mut u64,
+    delivered: &mut u64,
+    fee: &mut u64,
+    failed_count: &mut u64,
+    complete_count: &mut u64,
+    source_committed: &mut HashMap<String, u64>,
+    dest_committed: &mut HashMap<String, u64>,
+    liquidity_failed: &mut HashMap<Vec<String>, u64>,
+) {
+    *pending = pending.saturating_sub(rec.planned_msat);
+    *pending_fee =
+        pending_fee.saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
+    if rec.failed {
+        let src = source_committed.entry(rec.source_scid.clone()).or_default();
+        *src = src.saturating_sub(rec.planned_sent_msat);
+        let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
+        *dst = dst.saturating_sub(rec.planned_msat);
+        *failed_count += 1;
+        // A late liquidity failure must reach the retry-stop ledger
+        // with the reservation it refunds: without the entry, a later
+        // solve re-plans the failed route one msat lower, round after
+        // round, and burns maxrounds under the request gate
+        // (retries_liquidity_failures).
+        if let Some(path) = &rec.liquidity_failed_path {
+            liquidity_failed.insert(path.clone(), rec.planned_msat);
+        }
+    } else {
+        *delivered += rec.planned_msat;
+        *fee += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
+        *complete_count += 1;
     }
 }
 
@@ -530,8 +578,84 @@ async fn xrebalance(
     let fragment_msat = state.min_part_msat.load(Ordering::Relaxed).max(1);
     let mut round: u64 = 0;
     let stop_reason: String;
+    // The detached parts this request is still waiting on (issue #2):
+    // their watchers write terminal outcomes to the shared record, and
+    // each round reconciles them so a failure releases its reservation
+    // instead of sitting as pending to the end of the request.
+    let mut detached_known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut detached_failed: u64 = 0;
+    // Reconciled successes: counted into parts_complete at render time,
+    // the same way detached_failed folds into parts_failed (the saved
+    // round still says "pending" for a part that completes late).
+    let mut detached_complete: u64 = 0;
+
+    // Fold terminal outcomes of this request's detached parts into the
+    // running totals; called at the top of each round and once more
+    // before the response is rendered, so the pending fields report
+    // only what is still in flight.  A liquidity-class failure also
+    // enters the retry-stop ledger with the reservation it refunds.
+    fn reconcile_detached(
+        state: &State,
+        known: &mut std::collections::HashSet<String>,
+        pending: &mut u64,
+        pending_fee: &mut u64,
+        delivered: &mut u64,
+        fee: &mut u64,
+        failed_count: &mut u64,
+        complete_count: &mut u64,
+        source_committed: &mut HashMap<String, u64>,
+        dest_committed: &mut HashMap<String, u64>,
+        liquidity_failed: &mut HashMap<Vec<String>, u64>,
+        req: &str,
+    ) {
+        let mut records = state
+            .detached_outcomes
+            .lock()
+            .expect("detached outcomes lock");
+        let done: Vec<String> = known
+            .iter()
+            .filter(|h| records.contains_key(*h))
+            .cloned()
+            .collect();
+        for hash in done {
+            let rec = records.remove(&hash).expect("checked present");
+            known.remove(&hash);
+            fold_record(
+                &rec,
+                pending,
+                pending_fee,
+                delivered,
+                fee,
+                failed_count,
+                complete_count,
+                source_committed,
+                dest_committed,
+                liquidity_failed,
+            );
+            log::debug!(
+                "req {req}: detached part {hash} reached terminal state: \
+                 pending now {} msat",
+                eng(*pending)
+            );
+        }
+    }
+
     loop {
         round += 1;
+        reconcile_detached(
+            state,
+            &mut detached_known,
+            &mut pending_total,
+            &mut pending_fee_total,
+            &mut delivered_total,
+            &mut fee_total,
+            &mut detached_failed,
+            &mut detached_complete,
+            &mut source_committed,
+            &mut dest_committed,
+            &mut liquidity_failed,
+            &req,
+        );
         // Amounts still in flight count as committed: if a straggler
         // later fails, this request under-delivers rather than
         // double-spending its liquidity on a retry.
@@ -612,6 +736,9 @@ async fn xrebalance(
             *dest_committed.entry(scid.clone()).or_default() += *msat;
         }
         liquidity_failed.extend(outcome.liquidity_failed);
+        for hash in &outcome.detached {
+            detached_known.insert(hash.clone());
+        }
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
@@ -658,7 +785,36 @@ async fn xrebalance(
         "req {req}: finished after {} round(s): {stop_reason}",
         rounds.len()
     );
-    let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
+    // Once more, so a failure that landed after the last round is not
+    // reported as pending in the response (issue #2).
+    reconcile_detached(
+        state,
+        &mut detached_known,
+        &mut pending_total,
+        &mut pending_fee_total,
+        &mut delivered_total,
+        &mut fee_total,
+        &mut detached_failed,
+        &mut detached_complete,
+        &mut source_committed,
+        &mut dest_committed,
+        &mut liquidity_failed,
+        &req,
+    );
+    let mut summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
+    // The pending fields render from the reconciled record: the parts
+    // still pending at response time are exactly this request's
+    // detached parts without a terminal outcome yet.
+    summary["parts_pending"] = json!(detached_known.len());
+    summary["pending_msat"] = json!(pending_total);
+    if detached_failed > 0 {
+        let failed = summary["parts_failed"].as_u64().unwrap_or(0) + detached_failed;
+        summary["parts_failed"] = json!(failed);
+    }
+    if detached_complete > 0 {
+        let complete = summary["parts_complete"].as_u64().unwrap_or(0) + detached_complete;
+        summary["parts_complete"] = json!(complete);
+    }
     let mut response = serde_json::json!({
         "status": "executed",
         "label": parsed.label,
@@ -1006,11 +1162,111 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
+    use super::exec::DetachedOutcomeRecord;
     use super::{
-        draw_down, eng, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict,
+        draw_down, eng, fold_record, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim,
+        ClaimVerdict,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// A detached-part record with every field the fold reads.
+    fn record(failed: bool, liquidity_path: Option<Vec<&str>>) -> DetachedOutcomeRecord {
+        DetachedOutcomeRecord {
+            failed,
+            planned_msat: 1_000,
+            planned_sent_msat: 1_010,
+            source_scid: "100x1x0".into(),
+            dest_scid: "300x1x0".into(),
+            liquidity_failed_path: liquidity_path
+                .map(|p| p.into_iter().map(str::to_owned).collect()),
+            created: 0,
+        }
+    }
+
+    /// The fold's accumulators, zeroed, as one bundle.
+    #[derive(Default)]
+    struct Totals {
+        pending: u64,
+        pending_fee: u64,
+        delivered: u64,
+        fee: u64,
+        failed: u64,
+        complete: u64,
+        source_committed: HashMap<String, u64>,
+        dest_committed: HashMap<String, u64>,
+        liquidity_failed: HashMap<Vec<String>, u64>,
+    }
+
+    impl Totals {
+        fn fold(&mut self, rec: &DetachedOutcomeRecord) {
+            fold_record(
+                rec,
+                &mut self.pending,
+                &mut self.pending_fee,
+                &mut self.delivered,
+                &mut self.fee,
+                &mut self.failed,
+                &mut self.complete,
+                &mut self.source_committed,
+                &mut self.dest_committed,
+                &mut self.liquidity_failed,
+            );
+        }
+    }
+
+    #[test]
+    fn failed_record_releases_reservation_and_feeds_retry_ledger() {
+        let mut t = Totals {
+            pending: 1_000,
+            pending_fee: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(true, Some(vec!["100x1x0/0", "200x1x0/1"])));
+        assert_eq!(t.pending, 0);
+        assert_eq!(t.pending_fee, 0);
+        assert_eq!(t.failed, 1);
+        assert_eq!(t.source_committed, HashMap::from([("100x1x0".into(), 0)]));
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 0)]));
+        // The path enters the retry-stop ledger at the failed amount,
+        // so a later round re-planning it within a fragment is
+        // refused by retries_liquidity_failures.
+        assert_eq!(
+            t.liquidity_failed,
+            HashMap::from([(vec!["100x1x0/0".into(), "200x1x0/1".into()], 1_000)])
+        );
+    }
+
+    #[test]
+    fn non_liquidity_failure_releases_but_skips_the_ledger() {
+        let mut t = Totals::default();
+        t.fold(&record(true, None));
+        assert_eq!(t.failed, 1);
+        assert!(t.liquidity_failed.is_empty());
+    }
+
+    #[test]
+    fn completed_record_keeps_reservation_and_counts_complete() {
+        let mut t = Totals {
+            pending: 1_000,
+            pending_fee: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(false, None));
+        assert_eq!(t.pending, 0);
+        assert_eq!(t.delivered, 1_000);
+        assert_eq!(t.fee, 10);
+        assert_eq!(t.complete, 1);
+        // The caps stay drawn: a success has permanently consumed its
+        // share of the per-channel limits for this request.
+        assert_eq!(t.source_committed, HashMap::from([("100x1x0".into(), 1_010)]));
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 1_000)]));
+        assert!(t.liquidity_failed.is_empty());
+    }
 
     #[test]
     fn draw_down_shrinks_only_capped_specs() {
