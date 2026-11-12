@@ -714,6 +714,9 @@ async fn background_watch(
                 planned_sent_msat: part.planned_sent_msat,
                 source_scid: scid_of(&part.first_hop),
                 dest_scid: scid_of(&part.return_hop),
+                liquidity_failed_path: (part.status == "failed"
+                    && part.failcode == Some(WIRE_TEMPORARY_CHANNEL_FAILURE))
+                    .then(|| part.hops.iter().map(|h| h.scidd.clone()).collect()),
                 created: now_secs(),
             },
         );
@@ -738,6 +741,12 @@ pub struct DetachedOutcomeRecord {
     pub planned_sent_msat: u64,
     pub source_scid: String,
     pub dest_scid: String,
+    /// The scidd path, but only when the part failed for liquidity
+    /// (temporary_channel_failure): the owning request merges it
+    /// into its retry-stop ledger when the reservation is released,
+    /// so a later round cannot re-plan the failed route one msat
+    /// lower, round after round.
+    pub liquidity_failed_path: Option<Vec<String>>,
     /// For pruning records whose request never collected them.
     pub created: u64,
 }

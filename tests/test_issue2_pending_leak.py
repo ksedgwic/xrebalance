@@ -187,8 +187,18 @@ def test_issue2_late_completing_part_counts_and_caps(node_factory, bitcoind,
     assert s['parts_complete'] >= 1, s
     assert s['parts_complete'] + s['parts_failed'] + s['parts_pending'] \
         == s['parts'], s
-    assert s['parts_pending'] == 0 and r['pending_msat'] == 0, r
     assert r['delivered_msat'] > 0, r
+
+    # What the response reports pending must be exactly what is STILL
+    # in flight: the last round's part can still be held by l2 at
+    # response time (l2 holds every later arrival too), and that part
+    # is genuinely pending — the issue-#2 contract bans PHANTOM
+    # pending (nothing in flight reported as pending), not pending
+    # itself.  Releasing now settles exactly the held set, so the
+    # counts must match it.
+    rel = l2.rpc.call('release-htlcs')
+    assert s['parts_pending'] == rel['released'], (s, rel)
+    assert (r['pending_msat'] == 0) == (s['parts_pending'] == 0), r
 
     # (a) the cap bounds the WHOLE request: total drawn from the source
     # channel (delivered + fees, settled balance delta) must stay within

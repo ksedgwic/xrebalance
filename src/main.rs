@@ -424,6 +424,49 @@ fn draw_down(specs: &mut [spec::ChanSpec], committed: &HashMap<String, u64>) {
     }
 }
 
+/// Fold one terminal detached-part record into the request's running
+/// totals.  Only a failure gives the reservation back: a part that
+/// completed has permanently consumed its share of the per-channel
+/// caps for this request -- the cap bounds the whole request, not
+/// each round, so releasing a success would let draw_down re-grant
+/// that allowance to a later round and push a channel past its
+/// max_msat.
+fn fold_record(
+    rec: &exec::DetachedOutcomeRecord,
+    pending: &mut u64,
+    pending_fee: &mut u64,
+    delivered: &mut u64,
+    fee: &mut u64,
+    failed_count: &mut u64,
+    complete_count: &mut u64,
+    source_committed: &mut HashMap<String, u64>,
+    dest_committed: &mut HashMap<String, u64>,
+    liquidity_failed: &mut HashMap<Vec<String>, u64>,
+) {
+    *pending = pending.saturating_sub(rec.planned_msat);
+    *pending_fee =
+        pending_fee.saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
+    if rec.failed {
+        let src = source_committed.entry(rec.source_scid.clone()).or_default();
+        *src = src.saturating_sub(rec.planned_sent_msat);
+        let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
+        *dst = dst.saturating_sub(rec.planned_msat);
+        *failed_count += 1;
+        // A late liquidity failure must reach the retry-stop ledger
+        // with the reservation it refunds: without the entry, a later
+        // solve re-plans the failed route one msat lower, round after
+        // round, and burns maxrounds under the request gate
+        // (retries_liquidity_failures).
+        if let Some(path) = &rec.liquidity_failed_path {
+            liquidity_failed.insert(path.clone(), rec.planned_msat);
+        }
+    } else {
+        *delivered += rec.planned_msat;
+        *fee += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
+        *complete_count += 1;
+    }
+}
+
 async fn xrebalance(
     _plugin: Plugin<State>,
     params: serde_json::Value,
@@ -549,7 +592,8 @@ async fn xrebalance(
     // Fold terminal outcomes of this request's detached parts into the
     // running totals; called at the top of each round and once more
     // before the response is rendered, so the pending fields report
-    // only what is still in flight.
+    // only what is still in flight.  A liquidity-class failure also
+    // enters the retry-stop ledger with the reservation it refunds.
     fn reconcile_detached(
         state: &State,
         known: &mut std::collections::HashSet<String>,
@@ -561,6 +605,7 @@ async fn xrebalance(
         complete_count: &mut u64,
         source_committed: &mut HashMap<String, u64>,
         dest_committed: &mut HashMap<String, u64>,
+        liquidity_failed: &mut HashMap<Vec<String>, u64>,
         req: &str,
     ) {
         let mut records = state
@@ -575,26 +620,18 @@ async fn xrebalance(
         for hash in done {
             let rec = records.remove(&hash).expect("checked present");
             known.remove(&hash);
-            *pending = pending.saturating_sub(rec.planned_msat);
-            *pending_fee =
-                pending_fee.saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
-            // Only a failure gives the reservation back.  A part that
-            // completed has permanently consumed its share of the
-            // per-channel caps for this request: the cap bounds the
-            // whole request, not each round, so releasing a success
-            // would let draw_down re-grant that allowance to a later
-            // round and push a channel past its max_msat.
-            if rec.failed {
-                let src = source_committed.entry(rec.source_scid.clone()).or_default();
-                *src = src.saturating_sub(rec.planned_sent_msat);
-                let dst = dest_committed.entry(rec.dest_scid.clone()).or_default();
-                *dst = dst.saturating_sub(rec.planned_msat);
-                *failed_count += 1;
-            } else {
-                *delivered += rec.planned_msat;
-                *fee += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
-                *complete_count += 1;
-            }
+            fold_record(
+                &rec,
+                pending,
+                pending_fee,
+                delivered,
+                fee,
+                failed_count,
+                complete_count,
+                source_committed,
+                dest_committed,
+                liquidity_failed,
+            );
             log::debug!(
                 "req {req}: detached part {hash} reached terminal state: \
                  pending now {} msat",
@@ -616,6 +653,7 @@ async fn xrebalance(
             &mut detached_complete,
             &mut source_committed,
             &mut dest_committed,
+            &mut liquidity_failed,
             &req,
         );
         // Amounts still in flight count as committed: if a straggler
@@ -760,6 +798,7 @@ async fn xrebalance(
         &mut detached_complete,
         &mut source_committed,
         &mut dest_committed,
+        &mut liquidity_failed,
         &req,
     );
     let mut summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
@@ -1123,11 +1162,111 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
+    use super::exec::DetachedOutcomeRecord;
     use super::{
-        draw_down, eng, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim, ClaimVerdict,
+        draw_down, eng, fold_record, percent, spec::ChanSpec, summarize_rounds, try_claim, Claim,
+        ClaimVerdict,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// A detached-part record with every field the fold reads.
+    fn record(failed: bool, liquidity_path: Option<Vec<&str>>) -> DetachedOutcomeRecord {
+        DetachedOutcomeRecord {
+            failed,
+            planned_msat: 1_000,
+            planned_sent_msat: 1_010,
+            source_scid: "100x1x0".into(),
+            dest_scid: "300x1x0".into(),
+            liquidity_failed_path: liquidity_path
+                .map(|p| p.into_iter().map(str::to_owned).collect()),
+            created: 0,
+        }
+    }
+
+    /// The fold's accumulators, zeroed, as one bundle.
+    #[derive(Default)]
+    struct Totals {
+        pending: u64,
+        pending_fee: u64,
+        delivered: u64,
+        fee: u64,
+        failed: u64,
+        complete: u64,
+        source_committed: HashMap<String, u64>,
+        dest_committed: HashMap<String, u64>,
+        liquidity_failed: HashMap<Vec<String>, u64>,
+    }
+
+    impl Totals {
+        fn fold(&mut self, rec: &DetachedOutcomeRecord) {
+            fold_record(
+                rec,
+                &mut self.pending,
+                &mut self.pending_fee,
+                &mut self.delivered,
+                &mut self.fee,
+                &mut self.failed,
+                &mut self.complete,
+                &mut self.source_committed,
+                &mut self.dest_committed,
+                &mut self.liquidity_failed,
+            );
+        }
+    }
+
+    #[test]
+    fn failed_record_releases_reservation_and_feeds_retry_ledger() {
+        let mut t = Totals {
+            pending: 1_000,
+            pending_fee: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(true, Some(vec!["100x1x0/0", "200x1x0/1"])));
+        assert_eq!(t.pending, 0);
+        assert_eq!(t.pending_fee, 0);
+        assert_eq!(t.failed, 1);
+        assert_eq!(t.source_committed, HashMap::from([("100x1x0".into(), 0)]));
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 0)]));
+        // The path enters the retry-stop ledger at the failed amount,
+        // so a later round re-planning it within a fragment is
+        // refused by retries_liquidity_failures.
+        assert_eq!(
+            t.liquidity_failed,
+            HashMap::from([(vec!["100x1x0/0".into(), "200x1x0/1".into()], 1_000)])
+        );
+    }
+
+    #[test]
+    fn non_liquidity_failure_releases_but_skips_the_ledger() {
+        let mut t = Totals::default();
+        t.fold(&record(true, None));
+        assert_eq!(t.failed, 1);
+        assert!(t.liquidity_failed.is_empty());
+    }
+
+    #[test]
+    fn completed_record_keeps_reservation_and_counts_complete() {
+        let mut t = Totals {
+            pending: 1_000,
+            pending_fee: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(false, None));
+        assert_eq!(t.pending, 0);
+        assert_eq!(t.delivered, 1_000);
+        assert_eq!(t.fee, 10);
+        assert_eq!(t.complete, 1);
+        // The caps stay drawn: a success has permanently consumed its
+        // share of the per-channel limits for this request.
+        assert_eq!(t.source_committed, HashMap::from([("100x1x0".into(), 1_010)]));
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 1_000)]));
+        assert!(t.liquidity_failed.is_empty());
+    }
 
     #[test]
     fn draw_down_shrinks_only_capped_specs() {
