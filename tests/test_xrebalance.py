@@ -186,6 +186,60 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
     assert stats['layer']['depth_max'] >= 1, stats
 
 
+def test_remove_layer_relearns(node_factory, bitcoind, plugin_opts):
+    """An external askrene-remove-layer between two equal successes.
+
+    The coalescer must not remember the first success once the layer
+    it mirrors is gone: the second, equal success would be suppressed
+    as "already informed" (same bucket, no tightening), leaving the
+    recreated layer without the constraint.  The second amount is
+    equal, not larger -- a larger success tightens the bound and
+    re-informs even without the cache clear.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[plugin_opts, {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    chan23 = only_one([c for c in l1.rpc.listchannels(
+        source=l2.info['id'])['channels']
+        if c['destination'] == l3.info['id']])
+    scidd23 = f"{chan23['short_channel_id']}/{chan23['direction']}"
+
+    def network_min():
+        xlayer = only_one(l1.rpc.askrene_listlayers('xrebalance')['layers'])
+        return max((c.get('minimum_msat', 0) for c in xlayer['constraints']
+                    if c['short_channel_id_dir'] == scidd23), default=0)
+
+    # First request completes, so the network hop's success reaches
+    # the persistent layer (and the coalescer remembers informing it).
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            maxrounds=1, label='before-remove')
+    assert res['status'] == 'executed', res
+    assert only_one(res['parts'])['status'] == 'complete', res
+    assert network_min() >= 100000
+
+    # The layer is removed out from under the plugin.
+    l1.rpc.askrene_remove_layer('xrebalance')
+    stats = l1.rpc.call('xrebalance-stats')
+    assert stats['layer']['exists'] is False, stats
+
+    # Second request: the SAME amount over the same route.
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000,
+                            maxrounds=1, label='after-remove')
+    assert res['status'] == 'executed', res
+    assert only_one(res['parts'])['status'] == 'complete', res
+
+    # The recreated layer re-learned the network hop.
+    assert network_min() >= 100000
+
+
 def test_failure_feedback(node_factory, bitcoind, plugin_opts):
     """A network hop without the liquidity the plan assumes.
 
@@ -780,3 +834,58 @@ def test_source_bound_leaves_room_for_part_extras(node_factory, bitcoind,
     assert res['delivered_msat'] == effective, res
     crossing = sum(r['path'][0]['amount_in_msat'] for r in res['routes'])
     assert crossing <= cap, (crossing, res)
+
+
+def test_coalescer_cache_cleared_on_layer_recreation(node_factory, bitcoind,
+                                                     plugin_opts):
+    """A request that completes informs the persistent layer AND the
+    coalescer. If the layer is then removed externally, the next
+    request must re-inform the RECREATED layer: the coalescer cache is
+    cleared when the layer is (re)created, so "already informed" from
+    the removed layer cannot suppress the write. Regression shape from
+    the #7 review: the second amount must NOT be larger (a larger
+    success tightens the lower bound and passes even without the fix).
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[{**plugin_opts, 'fee-base': 2500, 'fee-per-satoshi': 500},
+              {}, {}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+    chan23 = only_one([c for c in l1.rpc.listchannels(
+        source=l2.info['id'])['channels']
+        if c['destination'] == l3.info['id']])
+    scidd23 = f"{chan23['short_channel_id']}/{chan23['direction']}"
+
+    def layer_constraints():
+        xlayer = only_one(l1.rpc.askrene_listlayers('xrebalance')['layers'])
+        return [c for c in xlayer['constraints']
+                if c['short_channel_id_dir'] == scidd23]
+
+    # First request completes and informs the layer (and the cache).
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000)
+    assert res['status'] == 'executed' and res['delivered_msat'] == 100000, res
+    assert layer_constraints(), "first request did not inform the layer"
+
+    # External removal (the user-facing counterpart of the original
+    # report): the layer AND its constraints disappear.
+    l1.rpc.askrene_remove_layer('xrebalance')
+    listed = [l for l in l1.rpc.askrene_listlayers()['layers']
+              if l['layer'] == 'xrebalance']
+    assert not listed or not listed[0]['constraints']
+
+    # SAME amount over the same route: the recreated layer must be
+    # re-informed -- without the cache clear the coalescer would treat
+    # the hop as already informed and write nothing.
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100000, maxfee_msat=5000)
+    assert res['status'] == 'executed' and res['delivered_msat'] == 100000, res
+    cons = layer_constraints()
+    assert cons, ("recreated layer holds no constraint for the network hop "
+                  "after an equal-amount repeat: coalescer cache survived "
+                  "the layer recreation")
+    assert max(c.get('minimum_msat', 0) for c in cons) >= 100000, cons
