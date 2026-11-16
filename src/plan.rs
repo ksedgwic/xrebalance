@@ -446,7 +446,12 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
         });
     }
 
-    ensure_persistent_layer(&mut rpc).await?;
+    if ensure_persistent_layer(&mut rpc).await? {
+        // The layer was absent (fresh node, or an external
+        // askrene-remove-layer): anything the coalescer remembers
+        // having written is gone with it.
+        state.coalescer.lock().expect("coalescer lock").clear();
+    }
     let cutoff = now_secs().saturating_sub(state.constraint_age.load(Ordering::Relaxed));
     call(
         &mut rpc,
@@ -620,7 +625,10 @@ async fn local_channels(rpc: &mut ClnRpc) -> Result<Local, Error> {
     Ok(Local { usable, fence })
 }
 
-async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
+/// Make sure the persistent constraint layer exists. Returns true when
+/// this call CREATED the layer (false when it was already there) —
+/// callers use that to drop caches that mirror the old layer's contents.
+async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<bool, Error> {
     let layers = call(rpc, "askrene-listlayers", json!({})).await?;
     let exists = layers["layers"]
         .as_array()
@@ -634,8 +642,9 @@ async fn ensure_persistent_layer(rpc: &mut ClnRpc) -> Result<(), Error> {
             json!({"layer": PERSISTENT_LAYER, "persistent": true}),
         )
         .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// A source's drain direction and the bounds on it: `bound` is what

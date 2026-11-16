@@ -116,6 +116,13 @@ impl Coalescer {
         self.cache.len()
     }
 
+    /// Drop all remembered observations: the authoritative store they
+    /// mirror (the persistent layer) is gone, so "already informed"
+    /// is no longer true for any key.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
     /// Drop entries idle past the aging window, so the cache does
     /// not grow with the set of channel-dirs seen over the process
     /// lifetime.  Amortised: swept once per 4096 emits.
