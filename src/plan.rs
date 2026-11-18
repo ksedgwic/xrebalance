@@ -177,19 +177,28 @@ pub fn route_path(route: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How far below a failed amount a route on the same path still
+/// counts as a retry: a fragment, the smallest amount a plan deals
+/// in, or two flow units of the amount solved for if that is more.
+/// The solver steps one unit under a bound; two leaves a margin.
+pub fn retry_tolerance_msat(fragment_msat: u64, solved_msat: u64) -> u64 {
+    let two_units = flow_unit_msat(solved_msat).map_or(0, |unit| unit.saturating_mul(2));
+    fragment_msat.max(two_units)
+}
+
 /// Whether every planned route retries a path this request already
 /// failed for liquidity, delivering no less than that failure's
-/// amount less one fragment.  A liquidity failure at X teaches the
+/// amount less the tolerance.  A liquidity failure at X teaches the
 /// solver that the channel carries less than X, which askrene stores
-/// as at most X - 1, so the next solve can plan the same path one
-/// msat lower, and would again after that failure; the step is real
-/// only when it exceeds a fragment, the smallest amount a plan deals
-/// in.  A plan with a route on an untried path, or on a tried path
-/// more than a fragment below the failure, is worth sending.
+/// as at most X - 1, so the next solve can plan the same path a
+/// little lower, and would again after that failure: one msat lower
+/// or one flow unit lower, depending on the askrene version.  A plan
+/// with a route on an untried path, or on a tried path more than the
+/// tolerance below the failure, is worth sending.
 pub fn retries_liquidity_failures(
     routes: &[Value],
     failed: &HashMap<Vec<String>, u64>,
-    fragment_msat: u64,
+    tolerance_msat: u64,
 ) -> bool {
     !routes.is_empty()
         && routes.iter().all(|route| {
@@ -200,7 +209,7 @@ pub fn retries_liquidity_failures(
                 .unwrap_or(0);
             failed
                 .get(&route_path(route))
-                .is_some_and(|&failed_msat| delivered >= failed_msat.saturating_sub(fragment_msat))
+                .is_some_and(|&failed_msat| delivered >= failed_msat.saturating_sub(tolerance_msat))
         })
 }
 
@@ -1231,7 +1240,7 @@ async fn plan_in_layer(
 mod tests {
     use super::{
         all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
-        part_within_rate, retries_liquidity_failures, route_path, HtlcSlots,
+        part_within_rate, retries_liquidity_failures, retry_tolerance_msat, route_path, HtlcSlots,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -1393,6 +1402,34 @@ mod tests {
             &[route(A, 198_999_999)],
             &tried,
             1_000_000
+        ));
+    }
+
+    // The tolerance is a fragment until two flow units exceed it.
+    #[test]
+    fn retry_tolerance_is_the_larger_of_a_fragment_and_two_flow_units() {
+        // At the single-path threshold nothing is quantized.
+        assert_eq!(retry_tolerance_msat(10_000, 1_000_000), 10_000);
+        assert_eq!(retry_tolerance_msat(10_000, 200_000_000), 400_000);
+        assert_eq!(retry_tolerance_msat(1_000_000, 400_000_000), 1_000_000);
+        assert_eq!(retry_tolerance_msat(1_000_000, 2_395_694_000), 4_791_388);
+    }
+
+    // The unit shave: the same path one flow unit under the failed
+    // amount is a retry at the tolerance of that solve.
+    #[test]
+    fn a_flow_unit_under_the_failure_is_a_retry() {
+        let tried = failed(&[(A, 139_800_000)]);
+        let tolerance = retry_tolerance_msat(10_000, 200_000_000);
+        assert!(retries_liquidity_failures(
+            &[route(A, 139_600_000)],
+            &tried,
+            tolerance
+        ));
+        assert!(!retries_liquidity_failures(
+            &[route(A, 139_399_999)],
+            &tried,
+            tolerance
         ));
     }
 

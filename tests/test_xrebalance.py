@@ -596,11 +596,13 @@ def test_retry_stop(node_factory, bitcoind, plugin_opts):
     msat under it.  When an earlier crossing recorded a lower bound at
     or above that, askrene takes the lower bound as wrong and the
     channel as exactly known: the next solve fills it to the bound at
-    no probability cost, so the same route is planned one msat lower
+    no probability cost, so the same route is planned a little lower
+    (one msat or one flow unit, depending on the askrene version)
     with the same high estimate; sent, it fails the same way, and the
-    request would run to maxrounds one msat at a time.  The loop must
+    request would run to maxrounds a step at a time.  The loop must
     instead end, unsent, when a plan only retries routes this request
-    already failed for liquidity within a fragment of the amount.
+    already failed for liquidity within the retry tolerance of the
+    amount.
     """
     # l1 -> l2 -> l3 is the corridor.  l1 -> l4 -> l3 charges
     # 3000 ppm and is wide: the solve at the full amount succeeds
