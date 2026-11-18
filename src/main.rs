@@ -580,18 +580,24 @@ async fn xrebalance(
             );
         }
         // A liquidity failure at X is stored as "at most X - 1", so
-        // the next solve may plan the same path one msat lower,
-        // round after round; each failure is a feedback write, so
-        // the stall check below never sees it.  A plan that only
-        // retries failed paths within a fragment of their amounts
-        // ends the request unsent.
+        // the next solve may plan the same path a little lower (one
+        // msat, or one flow unit), round after round; each failure
+        // is a feedback write, so the stall check below never sees
+        // it.  A plan that only retries failed paths within the
+        // tolerance of their amounts ends the request unsent.
+        let retry_tolerance_msat =
+            plan::retry_tolerance_msat(fragment_msat, planned.effective_amount_msat);
         if round > 1
-            && plan::retries_liquidity_failures(&planned.routes, &liquidity_failed, fragment_msat)
+            && plan::retries_liquidity_failures(
+                &planned.routes,
+                &liquidity_failed,
+                retry_tolerance_msat,
+            )
         {
             stop_reason = format!(
                 "stalled: every planned part retries a route this request \
                  already failed for liquidity, within {} msat of the amount",
-                eng(fragment_msat)
+                eng(retry_tolerance_msat)
             );
             break;
         }
