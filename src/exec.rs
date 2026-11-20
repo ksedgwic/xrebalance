@@ -704,6 +704,52 @@ async fn background_watch(
         ("failed", Some(data)) => apply_feedback(plugin.state(), &part, Some(data)).await,
         _ => {}
     }
+    // Tell the owning request loop this part's terminal state, so a
+    // failure releases its pending reservation instead of sitting as
+    // pending to the end of the request.  Written after the feedback:
+    // a part that fails inside its round has its feedback written
+    // before the next round plans, and the released amount must not
+    // reach a new round without the constraint the failure produced.
+    plugin
+        .state()
+        .detached_outcomes
+        .lock()
+        .expect("detached outcomes lock")
+        .insert(
+            part.payment_hash.clone(),
+            DetachedOutcomeRecord {
+                failed: part.status == "failed",
+                planned_msat: part.planned_msat,
+                planned_sent_msat: part.planned_sent_msat,
+                source_scid: scid_of(&part.first_hop),
+                dest_scid: scid_of(&part.return_hop),
+                liquidity_failed_path: (part.status == "failed"
+                    && part.failcode == Some(WIRE_TEMPORARY_CHANNEL_FAILURE))
+                .then(|| part.hops.iter().map(|h| h.scidd.clone()).collect()),
+                created: now_secs(),
+            },
+        );
+}
+
+/// What a background watcher learned about a detached part, for the
+/// owning request loop to reconcile into its pending/committed
+/// accounting (a detached part that failed used to stay reserved as
+/// pending for the rest of the request).
+#[derive(Clone)]
+pub struct DetachedOutcomeRecord {
+    pub failed: bool,
+    pub planned_msat: u64,
+    pub planned_sent_msat: u64,
+    pub source_scid: String,
+    pub dest_scid: String,
+    /// The scidd path, but only when the part failed for liquidity
+    /// (temporary_channel_failure): the owning request merges it
+    /// into its retry-stop ledger when the reservation is released,
+    /// so a later round cannot re-plan the failed route one msat
+    /// lower, round after round.
+    pub liquidity_failed_path: Option<Vec<String>>,
+    /// For pruning records whose request never collected them.
+    pub created: u64,
 }
 
 /// One round's executed outcome: the rendered response plus the
@@ -715,6 +761,10 @@ pub struct ExecOutcome {
     /// Planned delivery of parts still in flight at the snapshot
     /// close; the loop treats it as committed.
     pub pending_msat: u64,
+    /// Payment hashes of those in-flight parts: their watchers write
+    /// terminal outcomes to State.detached_outcomes, and the request
+    /// loop reconciles them.
+    pub detached: Vec<String>,
     /// Planned fees of those in-flight parts, reserved against an
     /// absolute (msat) budget.
     pub pending_fee_msat: u64,
@@ -781,6 +831,7 @@ fn outcome(params: &XRebalanceParams, plan: &PlanResult, parts: &[Part]) -> Exec
             .sum(),
         source_committed_msat,
         dest_committed_msat,
+        detached: pending.iter().map(|p| p.payment_hash.clone()).collect(),
         response: render(params, plan, parts),
     }
 }
@@ -798,11 +849,17 @@ pub async fn execute(
         return Ok(outcome(params, plan, &parts));
     }
 
-    // Prune stale claims once per request.
+    // Prune stale claims once per request, and with them any detached
+    // outcome records a finished request never collected.
     {
-        let mut claims = state.claims.lock().expect("claims lock");
         let cutoff = now_secs().saturating_sub(CLAIM_MAX_AGE_SECS);
+        let mut claims = state.claims.lock().expect("claims lock");
         claims.retain(|_, c| c.created >= cutoff);
+        state
+            .detached_outcomes
+            .lock()
+            .expect("detached outcomes lock")
+            .retain(|_, r| r.created >= cutoff);
     }
 
     let label = format!(
@@ -1070,6 +1127,7 @@ mod tests {
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
             feedback_writes: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),
+            detached_outcomes: Arc::new(Mutex::new(HashMap::new())),
             coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(6 * 60 * 60))),
             overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(3600))),
             self_id: Arc::new(OnceLock::new()),

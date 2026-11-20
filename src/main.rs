@@ -225,6 +225,10 @@ pub struct State {
     pub feedback_writes: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Terminal outcomes of parts that detached to background_watch,
+    /// keyed by payment_hash; the owning request reconciles them into
+    /// its pending/committed accounting.
+    pub detached_outcomes: Arc<Mutex<HashMap<String, exec::DetachedOutcomeRecord>>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
     pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
     /// Learned gossip overrides, applied per request (overrides.rs).
@@ -387,6 +391,7 @@ async fn run() -> Result<(), Error> {
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
+        detached_outcomes: Arc::new(Mutex::new(HashMap::new())),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
         overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
@@ -418,6 +423,125 @@ fn draw_down(specs: &mut [spec::ChanSpec], committed: &HashMap<String, u64>) {
         if let (Some(cap), Some(used)) = (s.max_msat, committed.get(&s.scid)) {
             s.max_msat = Some(cap.saturating_sub(*used));
         }
+    }
+}
+
+/// The request's running totals: what the rounds delivered, what the
+/// detached parts still hold in flight, and the per-target
+/// commitments the later rounds draw down from.
+#[derive(Default)]
+struct RequestTotals {
+    delivered_msat: u64,
+    fee_msat: u64,
+    /// Planned amounts of parts still in flight; the loop treats
+    /// them as committed.
+    pending_msat: u64,
+    /// Planned fees of those parts, reserved against an absolute
+    /// (msat) budget.
+    pending_fee_msat: u64,
+    /// Detached parts whose terminal outcome has been folded, by
+    /// class.
+    parts_failed: u64,
+    parts_complete: u64,
+    /// Committed flow by target channel so far -- sent (sources,
+    /// fees included) and delivered (destinations) -- drawn down
+    /// from the per-target limits each round, so a limit bounds the
+    /// whole request, not each round.
+    source_committed: HashMap<String, u64>,
+    dest_committed: HashMap<String, u64>,
+    /// The paths this request has failed for liquidity, each with
+    /// the amount that failed, so a later plan that only retries
+    /// them is not sent (see retries_liquidity_failures).
+    liquidity_failed: HashMap<Vec<String>, u64>,
+}
+
+impl RequestTotals {
+    fn add_round(&mut self, o: &exec::ExecOutcome) {
+        self.delivered_msat += o.delivered_msat;
+        self.fee_msat += o.fee_msat;
+        self.pending_msat += o.pending_msat;
+        self.pending_fee_msat += o.pending_fee_msat;
+        for (scid, msat) in &o.source_committed_msat {
+            *self.source_committed.entry(scid.clone()).or_default() += *msat;
+        }
+        for (scid, msat) in &o.dest_committed_msat {
+            *self.dest_committed.entry(scid.clone()).or_default() += *msat;
+        }
+        for (path, amt) in &o.liquidity_failed {
+            self.liquidity_failed.insert(path.clone(), *amt);
+        }
+    }
+
+    /// Fold one terminal detached-part record into the totals.
+    /// Only a failure gives the reservation back: a part that
+    /// completed has permanently consumed its share of the
+    /// per-channel caps for this request -- the cap bounds the whole
+    /// request, not each round, so releasing a success would let
+    /// draw_down re-grant that allowance to a later round and push a
+    /// channel past its max_msat.
+    fn fold(&mut self, rec: &exec::DetachedOutcomeRecord) {
+        self.pending_msat = self.pending_msat.saturating_sub(rec.planned_msat);
+        self.pending_fee_msat = self
+            .pending_fee_msat
+            .saturating_sub(rec.planned_sent_msat.saturating_sub(rec.planned_msat));
+        if rec.failed {
+            let src = self
+                .source_committed
+                .entry(rec.source_scid.clone())
+                .or_default();
+            *src = src.saturating_sub(rec.planned_sent_msat);
+            let dst = self
+                .dest_committed
+                .entry(rec.dest_scid.clone())
+                .or_default();
+            *dst = dst.saturating_sub(rec.planned_msat);
+            self.parts_failed += 1;
+            // A late liquidity failure must reach the retry-stop
+            // ledger with the reservation it refunds: without the
+            // entry, a later solve re-plans the failed route one msat
+            // lower, round after round, and burns maxrounds under the
+            // request gate (retries_liquidity_failures).
+            if let Some(path) = &rec.liquidity_failed_path {
+                self.liquidity_failed.insert(path.clone(), rec.planned_msat);
+            }
+        } else {
+            self.delivered_msat += rec.planned_msat;
+            self.fee_msat += rec.planned_sent_msat.saturating_sub(rec.planned_msat);
+            self.parts_complete += 1;
+        }
+    }
+
+    /// Fold the terminal outcomes of this request's detached parts
+    /// into the totals; called at the top of each round and once
+    /// more before the response is rendered, so the pending fields
+    /// report only what is still in flight.  A liquidity-class
+    /// failure also enters the retry-stop ledger with the
+    /// reservation it refunds.
+    fn reconcile(&mut self, state: &State, known: &mut HashSet<String>, req: &str) {
+        let mut records = state
+            .detached_outcomes
+            .lock()
+            .expect("detached outcomes lock");
+        let done: Vec<String> = known
+            .iter()
+            .filter(|h| records.contains_key(*h))
+            .cloned()
+            .collect();
+        for hash in done {
+            let rec = records.remove(&hash).expect("checked present");
+            known.remove(&hash);
+            self.fold(&rec);
+            log::debug!(
+                "req {req}: detached part {hash} reached terminal state: \
+                 pending now {} msat",
+                eng(self.pending_msat)
+            );
+        }
+    }
+
+    /// Settled plus in-flight: what the request has committed so far.
+    fn committed_msat(&self) -> u64 {
+        self.delivered_msat.saturating_add(self.pending_msat)
     }
 }
 
@@ -515,30 +639,24 @@ async fn xrebalance(
     let _gate = state.request_gate.lock().await;
     let req = parsed.label.clone().unwrap_or_else(|| "?".into());
     let mut rounds: Vec<serde_json::Value> = Vec::new();
-    let mut delivered_total: u64 = 0;
-    let mut fee_total: u64 = 0;
-    let mut pending_total: u64 = 0;
-    let mut pending_fee_total: u64 = 0;
-    // Committed flow by target channel so far -- sent (sources,
-    // fees included) and delivered (destinations) -- drawn down
-    // from the per-target limits each round, so a limit bounds the
-    // whole request, not each round.
-    let mut source_committed: HashMap<String, u64> = HashMap::new();
-    let mut dest_committed: HashMap<String, u64> = HashMap::new();
-    // The paths this request has failed for liquidity, each with
-    // the amount that failed, so a later plan that only retries
-    // them is not sent (see retries_liquidity_failures).
-    let mut liquidity_failed: HashMap<Vec<String>, u64> = HashMap::new();
+    let mut totals = RequestTotals::default();
     let fragment_msat = state.min_part_msat.load(Ordering::Relaxed).max(1);
     let mut round: u64 = 0;
     let stop_reason: String;
+    // The detached parts this request is still waiting on: their
+    // watchers write terminal outcomes to the shared record, and
+    // each round reconciles them so a failure releases its
+    // reservation instead of sitting as pending to the end of the
+    // request.
+    let mut detached_known: HashSet<String> = HashSet::new();
+
     loop {
         round += 1;
+        totals.reconcile(state, &mut detached_known, &req);
         // Amounts still in flight count as committed: if a straggler
         // later fails, this request under-delivers rather than
         // double-spending its liquidity on a retry.
-        let committed = delivered_total.saturating_add(pending_total);
-        let remaining = parsed.amount_msat.saturating_sub(committed);
+        let remaining = parsed.amount_msat.saturating_sub(totals.committed_msat());
         if round > 1 && remaining < fragment_msat {
             stop_reason = if remaining == 0 {
                 "amount fully committed".into()
@@ -553,11 +671,11 @@ async fn xrebalance(
             // An absolute budget is one pot across the rounds:
             // settled and reserved (pending-part) fees come off it.
             round_params.maxfee_msat =
-                Some(pot.saturating_sub(fee_total.saturating_add(pending_fee_total)));
+                Some(pot.saturating_sub(totals.fee_msat.saturating_add(totals.pending_fee_msat)));
         }
         // Per-target limits are one pot across the rounds too.
-        draw_down(&mut round_params.sources, &source_committed);
-        draw_down(&mut round_params.destinations, &dest_committed);
+        draw_down(&mut round_params.sources, &totals.source_committed);
+        draw_down(&mut round_params.destinations, &totals.dest_committed);
         let fb_before = state.feedback_writes.load(Ordering::Relaxed);
         let planned = match plan::plan(state, &round_params).await {
             Ok(p) => p,
@@ -590,7 +708,7 @@ async fn xrebalance(
         if round > 1
             && plan::retries_liquidity_failures(
                 &planned.routes,
-                &liquidity_failed,
+                &totals.liquidity_failed,
                 retry_tolerance_msat,
             )
         {
@@ -609,28 +727,20 @@ async fn xrebalance(
             }
             Err(e) => return Err(e),
         };
-        delivered_total += outcome.delivered_msat;
-        fee_total += outcome.fee_msat;
-        pending_total += outcome.pending_msat;
-        pending_fee_total += outcome.pending_fee_msat;
-        for (scid, msat) in &outcome.source_committed_msat {
-            *source_committed.entry(scid.clone()).or_default() += *msat;
+        for hash in &outcome.detached {
+            detached_known.insert(hash.clone());
         }
-        for (scid, msat) in &outcome.dest_committed_msat {
-            *dest_committed.entry(scid.clone()).or_default() += *msat;
-        }
-        liquidity_failed.extend(outcome.liquidity_failed);
+        let round_delivered = outcome.delivered_msat;
+        totals.add_round(&outcome);
         rounds.push(outcome.response);
         if rounds_max > 1 {
             log::debug!(
                 "req {req}: round {round}/{rounds_max}: delivered {} msat \
                  this round ({} total), {} msat pending, {} msat remaining",
-                eng(outcome.delivered_msat),
-                eng(delivered_total),
-                eng(pending_total),
-                eng(parsed
-                    .amount_msat
-                    .saturating_sub(delivered_total.saturating_add(pending_total))),
+                eng(round_delivered),
+                eng(totals.delivered_msat),
+                eng(totals.pending_msat),
+                eng(parsed.amount_msat.saturating_sub(totals.committed_msat())),
             );
         }
         if no_routes {
@@ -666,17 +776,22 @@ async fn xrebalance(
         "req {req}: finished after {} round(s): {stop_reason}",
         rounds.len()
     );
-    let summary = summarize_rounds(&rounds, delivered_total, fee_total, pending_total);
+    // Once more, so a failure that landed after the last round is
+    // not reported as pending in the response.
+    totals.reconcile(state, &mut detached_known, &req);
+    // The parts still pending at response time are exactly this
+    // request's detached parts without a terminal outcome yet.
+    let summary = summarize_rounds(&rounds, &totals, detached_known.len() as u64);
     let mut response = serde_json::json!({
         "status": "executed",
         "label": parsed.label,
         "amount_msat": parsed.amount_msat,
         "rounds_run": rounds.len(),
         "stop_reason": stop_reason,
-        "delivered_msat": delivered_total,
-        "fee_msat": fee_total,
-        "fee_ppm": plan::fee_ppm(fee_total, delivered_total),
-        "pending_msat": pending_total,
+        "delivered_msat": totals.delivered_msat,
+        "fee_msat": totals.fee_msat,
+        "fee_ppm": plan::fee_ppm(totals.fee_msat, totals.delivered_msat),
+        "pending_msat": totals.pending_msat,
         "summary": summary,
     });
     if parsed.verbose.unwrap_or(false) {
@@ -690,32 +805,37 @@ async fn xrebalance(
 /// object's keys serialize in sorted order, which lands it after
 /// the bulky "rounds" array: the summary is what remains on screen
 /// when the details scroll by.
+///
+/// The status counts render from `totals`, the reconciled record --
+/// a detached part that reached its terminal state after its round
+/// closed counts at its outcome, not as the "pending" its saved
+/// round still says -- and `closest_miss` is decided on those same
+/// counts.
 fn summarize_rounds(
     rounds: &[serde_json::Value],
-    delivered_msat: u64,
-    fee_msat: u64,
-    pending_msat: u64,
+    totals: &RequestTotals,
+    parts_pending: u64,
 ) -> serde_json::Value {
     let parts: Vec<&serde_json::Value> = rounds
         .iter()
         .filter_map(|r| r["parts"].as_array())
         .flatten()
         .collect();
-    let count = |s: &str| parts.iter().filter(|p| p["status"] == s).count();
-    let complete = count("complete");
-    let pending = count("pending");
+    let count = |s: &str| parts.iter().filter(|p| p["status"] == s).count() as u64;
+    let complete = count("complete") + totals.parts_complete;
+    let failed = count("failed") + totals.parts_failed;
     let mut summary = json!({
         "rounds": rounds.len(),
         "parts": parts.len(),
         "parts_complete": complete,
-        "parts_failed": count("failed"),
-        "parts_pending": pending,
-        "delivered_msat": delivered_msat,
-        "fee_msat": fee_msat,
-        "fee_ppm": plan::fee_ppm(fee_msat, delivered_msat),
-        "pending_msat": pending_msat,
+        "parts_failed": failed,
+        "parts_pending": parts_pending,
+        "delivered_msat": totals.delivered_msat,
+        "fee_msat": totals.fee_msat,
+        "fee_ppm": plan::fee_ppm(totals.fee_msat, totals.delivered_msat),
+        "pending_msat": totals.pending_msat,
     });
-    if complete == 0 && pending == 0 {
+    if complete == 0 && parts_pending == 0 {
         // Nothing moved and nothing is in flight: report the part
         // that came nearest to landing, so the wall is visible
         // without reading the rounds.  Nearest = fewest hops left
@@ -1113,12 +1233,83 @@ async fn htlc_accepted(
 
 #[cfg(test)]
 mod tests {
+    use super::exec::DetachedOutcomeRecord;
     use super::{
         draw_down, eng, layer_counts, percent, secs_until_next_hour, spec::ChanSpec, stats_line,
-        summarize_rounds, try_claim, Claim, ClaimVerdict,
+        summarize_rounds, try_claim, Claim, ClaimVerdict, RequestTotals,
     };
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    /// A detached-part record with every field the fold reads.
+    fn record(failed: bool, liquidity_path: Option<Vec<&str>>) -> DetachedOutcomeRecord {
+        DetachedOutcomeRecord {
+            failed,
+            planned_msat: 1_000,
+            planned_sent_msat: 1_010,
+            source_scid: "100x1x0".into(),
+            dest_scid: "300x1x0".into(),
+            liquidity_failed_path: liquidity_path
+                .map(|p| p.into_iter().map(str::to_owned).collect()),
+            created: 0,
+        }
+    }
+
+    #[test]
+    fn failed_record_releases_reservation_and_feeds_retry_ledger() {
+        let mut t = RequestTotals {
+            pending_msat: 1_000,
+            pending_fee_msat: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(true, Some(vec!["100x1x0/0", "200x1x0/1"])));
+        assert_eq!(t.pending_msat, 0);
+        assert_eq!(t.pending_fee_msat, 0);
+        assert_eq!(t.parts_failed, 1);
+        assert_eq!(t.source_committed, HashMap::from([("100x1x0".into(), 0)]));
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 0)]));
+        // The path enters the retry-stop ledger at the failed amount,
+        // so a later round re-planning it within a fragment is
+        // refused by retries_liquidity_failures.
+        assert_eq!(
+            t.liquidity_failed,
+            HashMap::from([(vec!["100x1x0/0".into(), "200x1x0/1".into()], 1_000)])
+        );
+    }
+
+    #[test]
+    fn non_liquidity_failure_releases_but_skips_the_ledger() {
+        let mut t = RequestTotals::default();
+        t.fold(&record(true, None));
+        assert_eq!(t.parts_failed, 1);
+        assert!(t.liquidity_failed.is_empty());
+    }
+
+    #[test]
+    fn completed_record_keeps_reservation_and_counts_complete() {
+        let mut t = RequestTotals {
+            pending_msat: 1_000,
+            pending_fee_msat: 10,
+            source_committed: HashMap::from([("100x1x0".into(), 1_010)]),
+            dest_committed: HashMap::from([("300x1x0".into(), 1_000)]),
+            ..Default::default()
+        };
+        t.fold(&record(false, None));
+        assert_eq!(t.pending_msat, 0);
+        assert_eq!(t.delivered_msat, 1_000);
+        assert_eq!(t.fee_msat, 10);
+        assert_eq!(t.parts_complete, 1);
+        // The caps stay drawn: a success has permanently consumed its
+        // share of the per-channel limits for this request.
+        assert_eq!(
+            t.source_committed,
+            HashMap::from([("100x1x0".into(), 1_010)])
+        );
+        assert_eq!(t.dest_committed, HashMap::from([("300x1x0".into(), 1_000)]));
+        assert!(t.liquidity_failed.is_empty());
+    }
 
     #[test]
     fn draw_down_shrinks_only_capped_specs() {
@@ -1160,15 +1351,23 @@ mod tests {
             // A no-route round carries an empty parts array.
             json!({"parts": []}),
         ];
-        let s = summarize_rounds(&rounds, 200, 3, 300);
+        // The "pending" part of the saved round completed after the
+        // round closed: folded into the totals, not pending anymore.
+        let totals = RequestTotals {
+            delivered_msat: 200 + 300,
+            fee_msat: 3,
+            parts_complete: 1,
+            ..Default::default()
+        };
+        let s = summarize_rounds(&rounds, &totals, 0);
         assert_eq!(s["rounds"], 3);
         assert_eq!(s["parts"], 3);
-        assert_eq!(s["parts_complete"], 1);
+        assert_eq!(s["parts_complete"], 2);
         assert_eq!(s["parts_failed"], 1);
-        assert_eq!(s["parts_pending"], 1);
-        assert_eq!(s["delivered_msat"], 200);
+        assert_eq!(s["parts_pending"], 0);
+        assert_eq!(s["delivered_msat"], 500);
         assert_eq!(s["fee_msat"], 3);
-        assert_eq!(s["pending_msat"], 300);
+        assert_eq!(s["pending_msat"], 0);
         // Something landed: no miss to report.
         assert!(s.get("closest_miss").is_none());
     }
@@ -1185,7 +1384,7 @@ mod tests {
             // No failure geometry recorded: never the closest miss.
             {"status": "failed", "planned_msat": 900_000},
         ]})];
-        let s = summarize_rounds(&rounds, 0, 0, 0);
+        let s = summarize_rounds(&rounds, &RequestTotals::default(), 0);
         let miss = &s["closest_miss"];
         assert_eq!(miss["hops_short"], 2);
         assert_eq!(miss["planned_msat"], 250_000);
@@ -1200,8 +1399,34 @@ mod tests {
             {"status": "failed", "planned_msat": 100, "hops_short": 1},
             {"status": "pending", "planned_msat": 200},
         ]})];
-        let s = summarize_rounds(&rounds, 0, 0, 200);
+        // One part is genuinely still in flight.
+        let totals = RequestTotals {
+            pending_msat: 200,
+            ..Default::default()
+        };
+        let s = summarize_rounds(&rounds, &totals, 1);
         assert!(s.get("closest_miss").is_none());
+    }
+
+    #[test]
+    fn summarize_reports_miss_once_reconciled_pending_drains() {
+        // Every detached part reached a terminal state: the saved
+        // rounds still say "pending", the reconciled record does not,
+        // and the miss -- the part that came nearest to landing -- is
+        // visible.
+        let rounds = vec![json!({"parts": [
+            {"status": "failed", "planned_msat": 100, "hops_short": 1,
+             "erring_scidd": "1x1x1/0", "failcode": 4103},
+            {"status": "pending", "planned_msat": 200},
+        ]})];
+        let totals = RequestTotals {
+            parts_failed: 1,
+            ..Default::default()
+        };
+        let s = summarize_rounds(&rounds, &totals, 0);
+        assert_eq!(s["parts_pending"], 0);
+        assert_eq!(s["parts_failed"], 2);
+        assert_eq!(s["closest_miss"]["hops_short"], 1);
     }
 
     #[test]
