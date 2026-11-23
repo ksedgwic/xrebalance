@@ -237,6 +237,9 @@ pub struct State {
     /// Our node id, filled by the first plan; feedback needs it to
     /// refuse disabling our own node.
     pub self_id: Arc<OnceLock<String>>,
+    /// Whether the node has askrene-constrain-channel, filled by the
+    /// first liquidity write (plan.rs).
+    pub constrain_channel: Arc<OnceLock<bool>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -396,6 +399,7 @@ async fn run() -> Result<(), Error> {
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
         overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
+        constrain_channel: Arc::new(OnceLock::new()),
     };
     let plugin = configured.start(state).await?;
     log::info!(
