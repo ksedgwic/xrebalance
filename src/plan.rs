@@ -355,6 +355,27 @@ pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult
         .to_owned();
     let _ = state.self_id.set(self_id.clone());
 
+    let min_claim_blocks = match state.min_claim_blocks.get() {
+        Some(blocks) => *blocks,
+        None => {
+            let conf = call(&mut rpc, "listconfigs", json!({"config": "cltv-final"})).await?;
+            let blocks = conf["configs"]["cltv-final"]["value_int"]
+                .as_i64()
+                .ok_or_else(|| anyhow!("listconfigs: missing cltv-final"))?;
+            let _ = state.min_claim_blocks.set(blocks);
+            blocks
+        }
+    };
+    // A returning part arrives final_cltv blocks from its expiry, or
+    // fewer: below the minimum none would be claimed.
+    let final_cltv = state.final_cltv.load(Ordering::Relaxed);
+    if i64::try_from(final_cltv).unwrap_or(i64::MAX) < min_claim_blocks {
+        return Err(anyhow!(
+            "xrebalance-final-cltv {final_cltv} is below lightningd's \
+             cltv-final {min_claim_blocks}: no returning part would be claimed"
+        ));
+    }
+
     let local = local_channels(&mut rpc).await?;
     let chans = &local.usable;
     for spec in params.sources.iter().chain(&params.destinations) {

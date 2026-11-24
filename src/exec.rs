@@ -1070,6 +1070,7 @@ mod tests {
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
             feedback_writes: Arc::new(AtomicU64::new(0)),
             claims: Arc::new(Mutex::new(HashMap::new())),
+            min_claim_blocks: Arc::new(OnceLock::new()),
             coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(6 * 60 * 60))),
             overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(3600))),
             self_id: Arc::new(OnceLock::new()),

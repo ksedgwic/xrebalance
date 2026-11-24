@@ -8,6 +8,7 @@ from pyln.testing.fixtures import *  # noqa: F401,F403
 PLUGIN = Path(__file__).parent.parent / "target" / "debug" / "xrebalance"
 SUBSCRIBER = Path(__file__).parent / "plugins" / "part_subscriber.py"
 HOLD = Path(__file__).parent / "plugins" / "hold_htlcs.py"
+LOWER_EXPIRY = Path(__file__).parent / "plugins" / "lower_expiry.py"
 
 
 def pytest_configure(config):
@@ -39,6 +40,11 @@ def part_subscriber():
 @pytest.fixture
 def hold_htlcs():
     return str(HOLD)
+
+
+@pytest.fixture
+def lower_expiry():
+    return str(LOWER_EXPIRY)
 
 
 @pytest.fixture

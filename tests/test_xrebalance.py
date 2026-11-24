@@ -11,7 +11,7 @@ the persistent layer.
 """
 import pytest
 from pyln.client import RpcError
-from pyln.testing.utils import only_one, wait_for
+from pyln.testing.utils import only_one, sync_blockheight, wait_for
 
 
 def hop_fee(base_msat, ppm, amount_msat):
@@ -588,6 +588,95 @@ def test_first_hop_slot_cap(node_factory, bitcoind, plugin_opts, hold_htlcs):
     wait_for(lambda: htlcs_out() == [])
     res = l1.rpc.xrebalance(**ask)
     assert len(res['routes']) == 1, res
+
+
+def test_low_expiry_not_claimed(node_factory, bitcoind, plugin_opts,
+                                lower_expiry):
+    """The last-hop peer delivers the returning part with an expiry
+    one block below the one the part's onion names.  Hash, secret
+    and amount all match, since the onion is relayed intact.  The
+    plugin must leave the HTLC to lightningd, which fails it: the
+    peer gets no preimage and nothing moves.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[plugin_opts, {}, {'plugin': lower_expiry}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    def fill_msat():
+        return only_one(
+            l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
+
+    before = fill_msat()
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100_000, maxfee_msat=5_000,
+                            maxrounds=1, label='low-expiry')
+    assert res['status'] == 'executed', res
+    part = only_one(res['parts'])
+    assert part['status'] == 'failed', res
+    assert res['delivered_msat'] == 0, res
+    assert res['pending_msat'] == 0, res
+
+    assert l3.daemon.is_in_log(r'forwarding [0-9a-f]{64} with expiry')
+    assert l1.daemon.is_in_log(
+        r"not resolving [0-9a-f]{64}: htlc expires at block \d+, "
+        r"\d+ blocks away; the part's onion names block \d+")
+    # lightningd's own final-hop check fails the HTLC.
+    assert 'WIRE_FINAL_INCORRECT_CLTV_EXPIRY' in part['detail'], res
+    assert fill_msat() == before
+    assert l1.rpc.call('xrebalance-stats')['claims'] == 0
+
+
+def test_late_part_not_claimed(node_factory, bitcoind, plugin_opts,
+                               hold_htlcs):
+    """The last-hop peer holds the returning part and delivers it,
+    with the expiry its onion names, when fewer blocks remain than
+    lightningd accepts on a final hop (cltv-final).  The plugin must
+    leave the HTLC to lightningd, which fails it.
+    """
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True,
+        opts=[plugin_opts, {}, {'plugin': hold_htlcs}])
+    scid_fill, _ = l3.fundchannel(l1, announce_channel=False)
+
+    src = only_one(
+        l1.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
+    wait_for(lambda: 'remote' in only_one(
+        l1.rpc.listpeerchannels(l3.info['id'])['channels']).get('updates', {}))
+
+    def fill_msat():
+        return only_one(
+            l1.rpc.listpeerchannels(l3.info['id'])['channels'])['to_us_msat']
+
+    before = fill_msat()
+    res = l1.rpc.xrebalance(sources=[src], destinations=[scid_fill],
+                            amount_msat=100_000, maxfee_msat=5_000,
+                            part_wait=0, maxrounds=1, label='late')
+    assert only_one(res['parts'])['status'] == 'pending', res
+    l3.daemon.wait_for_log('holding htlc')
+
+    # The part left with final_cltv + 1 blocks to its expiry.  Mine
+    # until two fewer than cltv-final remain: too few for l1 to
+    # claim, still enough for l3 to forward (its cltv-delta is 6).
+    final_cltv = l1.rpc.call('xrebalance-stats')['options']['final_cltv']
+    cltv_final = l1.rpc.listconfigs('cltv-final')[
+        'configs']['cltv-final']['value_int']
+    bitcoind.generate_block(final_cltv + 1 - (cltv_final - 2))
+    sync_blockheight(bitcoind, [l1, l2, l3])
+    assert l3.rpc.call('release-htlcs') == {'released': 1}
+
+    l1.daemon.wait_for_log(
+        r"not resolving [0-9a-f]{64}: htlc expires at block \d+, "
+        r"%d blocks away; the part's onion names block \d+ and a claim "
+        r"needs %d blocks" % (cltv_final - 2, cltv_final))
+    l1.daemon.wait_for_log(r"subscriber got xrebalance_part:.*'failed'")
+    assert fill_msat() == before
+    wait_for(lambda: l1.rpc.call('xrebalance-stats')['claims'] == 0)
 
 
 def test_retry_stop(node_factory, bitcoind, plugin_opts):

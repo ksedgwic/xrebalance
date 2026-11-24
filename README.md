@@ -89,6 +89,7 @@ retrying, and using what each attempt showed.
 | a `fee_insufficient` with its channel_update blanked (some forwarders zero it for privacy)                                                                                | cannot tell stale gossip from an inbound fee, so temporarily excludes both candidate channels — otherwise the next plan would repeat the failure; the exclusions expire          |
 | a hop return a node-level error (`temporary_node_failure`, …)                                                                                                             | temporarily disables the node — excluding one channel would just re-route through the same node's other channels                                                                 |
 | the returning HTLC offer less than the part delivered                                                                                                                     | declines to settle it — releasing the preimage against a short HTLC would let the last-hop peer dishonestly claim the full amount upstream                                       |
+| the returning HTLC expire before the block the part asked for, or within fewer blocks than lightningd accepts on a final hop (`cltv-final`)                               | declines to settle it — with the preimage for an HTLC at or near its expiry, the last-hop peer could claim upstream, keep the HTLC in the channel, and take it back on-chain     |
 | a plan put more parts on one of our channels than it has free HTLC slots                                                                                                  | drops the parts past the free slots for the round — channeld would refuse them unsent (`temporary_channel_failure`, "Too many HTLCs"), and askrene has no slot model             |
 | no usable route at the asked amount (getroutes 205)                                                                                                                       | descends a ladder — 3/4, 1/2, 1/4, 1/8 of the amount — and plans the first amount the network can carry; a ladder run dry ends the request                                       |
 | routes only over the fee budget (getroutes 206)                                                                                                                           | stops rather than descending: base fees weigh more at smaller amounts, so cheaper routes do not appear further down                                                              |
@@ -197,8 +198,9 @@ set**: each carries its own preimage, payment_hash, and secret.
 Besides letting each part settle on its own, this means a node
 routing two parts cannot use the first part's preimage to claim
 the second, and intermediates cannot correlate the parts.  (The
-short-HTLC check is in the table above.)  Returning parts are
-claimed via the `htlc_accepted` hook — the plugin's only hook.
+short-HTLC and expiry checks are in the table above.)  Returning
+parts are claimed via the `htlc_accepted` hook — the plugin's only
+hook.
 
 One `xrebalance_part` notification is broadcast per part reaching a
 terminal state, carrying the part's own payment_hash, its

@@ -225,6 +225,11 @@ pub struct State {
     pub feedback_writes: Arc<AtomicU64>,
     /// payment_hash (hex) -> claim, consulted by htlc_accepted.
     pub claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Fewest blocks to its expiry at which an arriving part is
+    /// claimed: lightningd's cltv-final, its own minimum for a
+    /// final-hop HTLC.  Read by the first plan, so it is set before
+    /// any claim exists.
+    pub min_claim_blocks: Arc<OnceLock<i64>>,
     /// Suppresses redundant persistent-layer informs (coalesce.rs).
     pub coalescer: Arc<Mutex<coalesce::Coalescer>>,
     /// Learned gossip overrides, applied per request (overrides.rs).
@@ -387,6 +392,7 @@ async fn run() -> Result<(), Error> {
         request_gate: Arc::new(tokio::sync::Mutex::new(())),
         feedback_writes: Arc::new(AtomicU64::new(0)),
         claims: Arc::new(Mutex::new(HashMap::new())),
+        min_claim_blocks: Arc::new(OnceLock::new()),
         coalescer: Arc::new(Mutex::new(coalesce::Coalescer::new(constraint_age))),
         overrides: Arc::new(Mutex::new(overrides::Overrides::new(override_age))),
         self_id: Arc::new(OnceLock::new()),
@@ -1043,20 +1049,40 @@ enum ClaimVerdict {
         expected_msat: u64,
         incoming_msat: u64,
     },
+    /// Ours, but the HTLC expires before the block the part's onion
+    /// names, or in fewer blocks than min_claim_blocks.  Kept and
+    /// left to lightningd, like Underpaid.
+    ExpiresTooSoon {
+        cltv_expiry: u64,
+        onion_cltv: u64,
+        blocks_left: i64,
+    },
     /// Not ours: pass it down the hook chain untouched.
     Pass,
 }
 
 /// Match an arriving HTLC against the claim table: hash AND secret
-/// AND amount.  Resolving from the hook bypasses lightningd's own
-/// final-hop amount check (final_incorrect_htlc_amount), and the
-/// last-hop peer relays our onion intact -- secret included -- while
-/// choosing the HTLC amount itself.  Settling on hash and secret
-/// alone would let that peer offer less than the part delivers,
-/// learn the preimage anyway, and claim the full amount from its
-/// upstream, keeping the difference.  Overpayment settles: the
-/// sender loses nothing by it.
-fn try_claim(claims: &mut HashMap<String, Claim>, v: &serde_json::Value) -> ClaimVerdict {
+/// AND amount AND expiry.  Resolving from the hook bypasses
+/// lightningd's own final-hop amount check
+/// (final_incorrect_htlc_amount), and the last-hop peer relays our
+/// onion intact -- secret included -- while choosing the HTLC amount
+/// itself.  Settling on hash and secret alone would let that peer
+/// offer less than the part delivers, learn the preimage anyway, and
+/// claim the full amount from its upstream, keeping the difference.
+/// Overpayment settles: the sender loses nothing by it.
+///
+/// The expiry is checked for the same reason.  A hook resolve also
+/// bypasses lightningd's two final-hop expiry checks
+/// (final_incorrect_cltv_expiry, and cltv-final blocks to spare),
+/// and the last-hop peer chooses the HTLC's expiry as it chooses the
+/// amount.  Given the preimage for an HTLC at or near its expiry,
+/// that peer could claim from its upstream, leave the HTLC in the
+/// channel, and spend it by timeout on-chain.
+fn try_claim(
+    claims: &mut HashMap<String, Claim>,
+    v: &serde_json::Value,
+    min_claim_blocks: i64,
+) -> ClaimVerdict {
     let Some(hash) = v["htlc"]["payment_hash"].as_str() else {
         return ClaimVerdict::Pass;
     };
@@ -1074,6 +1100,21 @@ fn try_claim(claims: &mut HashMap<String, Claim>, v: &serde_json::Value) -> Clai
             incoming_msat,
         };
     }
+    // A missing or malformed expiry field never passes.
+    let cltv_expiry = v["htlc"]["cltv_expiry"].as_u64().unwrap_or(0);
+    let onion_cltv = v["onion"]["outgoing_cltv_value"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    let blocks_left = v["htlc"]["cltv_expiry_relative"]
+        .as_i64()
+        .unwrap_or(i64::MIN);
+    if cltv_expiry < onion_cltv || blocks_left < min_claim_blocks {
+        return ClaimVerdict::ExpiresTooSoon {
+            cltv_expiry,
+            onion_cltv,
+            blocks_left,
+        };
+    }
     let claim = claims.remove(hash).expect("present above");
     ClaimVerdict::Resolve {
         preimage: claim.preimage,
@@ -1086,9 +1127,16 @@ async fn htlc_accepted(
     plugin: Plugin<State>,
     v: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
+    // Unset only while no plan has run, and then no claim exists.
+    let min_claim_blocks = plugin
+        .state()
+        .min_claim_blocks
+        .get()
+        .copied()
+        .unwrap_or(i64::MAX);
     let verdict = {
         let mut claims = plugin.state().claims.lock().expect("claims lock");
-        try_claim(&mut claims, &v)
+        try_claim(&mut claims, &v, min_claim_blocks)
     };
     match verdict {
         ClaimVerdict::Resolve { preimage } => Ok(json!({
@@ -1104,6 +1152,19 @@ async fn htlc_accepted(
                 v["htlc"]["payment_hash"].as_str().unwrap_or("?"),
                 eng(incoming_msat),
                 eng(expected_msat),
+            );
+            Ok(json!({"result": "continue"}))
+        }
+        ClaimVerdict::ExpiresTooSoon {
+            cltv_expiry,
+            onion_cltv,
+            blocks_left,
+        } => {
+            log::warn!(
+                "not resolving {}: htlc expires at block {cltv_expiry}, \
+                 {blocks_left} blocks away; the part's onion names block \
+                 {onion_cltv} and a claim needs {min_claim_blocks} blocks",
+                v["htlc"]["payment_hash"].as_str().unwrap_or("?"),
             );
             Ok(json!({"result": "continue"}))
         }
@@ -1244,10 +1305,31 @@ mod tests {
         claims
     }
 
+    /// The min_claim_blocks the tests claim under.
+    const MIN_BLOCKS: i64 = 18;
+
+    /// An HTLC with the expiry its onion names, 40 blocks away.
     fn htlc(hash: &str, secret: &str, amount_msat: u64) -> serde_json::Value {
+        expiring(hash, secret, amount_msat, 1040, 40)
+    }
+
+    /// An HTLC whose onion names block 1040, expiring at cltv_expiry,
+    /// blocks_left from the current block.
+    fn expiring(
+        hash: &str,
+        secret: &str,
+        amount_msat: u64,
+        cltv_expiry: u64,
+        blocks_left: i64,
+    ) -> serde_json::Value {
         json!({
-            "htlc": {"payment_hash": hash, "amount_msat": amount_msat},
-            "onion": {"payment_secret": secret},
+            "htlc": {
+                "payment_hash": hash,
+                "amount_msat": amount_msat,
+                "cltv_expiry": cltv_expiry,
+                "cltv_expiry_relative": blocks_left,
+            },
+            "onion": {"payment_secret": secret, "outgoing_cltv_value": 1040},
         })
     }
 
@@ -1255,14 +1337,17 @@ mod tests {
     fn whole_htlc_resolves_and_consumes_the_claim() {
         let mut claims = one_claim(1000);
         let v = htlc(&hash(), &secret(), 1000);
-        match try_claim(&mut claims, &v) {
+        match try_claim(&mut claims, &v, MIN_BLOCKS) {
             ClaimVerdict::Resolve { preimage } => {
                 assert_eq!(preimage, "11".repeat(32))
             }
             _ => panic!("expected resolve"),
         }
         assert!(claims.is_empty());
-        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Pass
+        ));
     }
 
     #[test]
@@ -1270,7 +1355,7 @@ mod tests {
         let mut claims = one_claim(1000);
         let v = htlc(&hash(), &secret(), 1001);
         assert!(matches!(
-            try_claim(&mut claims, &v),
+            try_claim(&mut claims, &v, MIN_BLOCKS),
             ClaimVerdict::Resolve { .. }
         ));
     }
@@ -1280,7 +1365,7 @@ mod tests {
         let mut claims = one_claim(1000);
         let v = htlc(&hash(), &secret(), 999);
         assert!(matches!(
-            try_claim(&mut claims, &v),
+            try_claim(&mut claims, &v, MIN_BLOCKS),
             ClaimVerdict::Underpaid {
                 expected_msat: 1000,
                 incoming_msat: 999,
@@ -1288,7 +1373,7 @@ mod tests {
         ));
         let v = htlc(&hash(), &secret(), 1000);
         assert!(matches!(
-            try_claim(&mut claims, &v),
+            try_claim(&mut claims, &v, MIN_BLOCKS),
             ClaimVerdict::Resolve { .. }
         ));
     }
@@ -1301,7 +1386,7 @@ mod tests {
             "onion": {"payment_secret": secret()},
         });
         assert!(matches!(
-            try_claim(&mut claims, &v),
+            try_claim(&mut claims, &v, MIN_BLOCKS),
             ClaimVerdict::Underpaid {
                 incoming_msat: 0,
                 ..
@@ -1311,10 +1396,106 @@ mod tests {
     }
 
     #[test]
+    fn expiry_below_the_onions_is_refused_and_the_claim_kept() {
+        let mut claims = one_claim(1000);
+        let v = expiring(&hash(), &secret(), 1000, 1039, 39);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::ExpiresTooSoon {
+                cltv_expiry: 1039,
+                onion_cltv: 1040,
+                blocks_left: 39,
+            }
+        ));
+        let v = htlc(&hash(), &secret(), 1000);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn expiry_above_the_onions_resolves() {
+        let mut claims = one_claim(1000);
+        let v = expiring(&hash(), &secret(), 1000, 1041, 41);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn too_few_blocks_left_is_refused() {
+        // The expiry the onion names, delivered late: one block
+        // short of the minimum, then exactly at it.
+        let mut claims = one_claim(1000);
+        let v = expiring(&hash(), &secret(), 1000, 1040, MIN_BLOCKS - 1);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::ExpiresTooSoon { .. }
+        ));
+        assert_eq!(claims.len(), 1);
+        let v = expiring(&hash(), &secret(), 1000, 1040, MIN_BLOCKS);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn expired_htlc_is_refused() {
+        let mut claims = one_claim(1000);
+        let v = expiring(&hash(), &secret(), 1000, 1040, -3);
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::ExpiresTooSoon {
+                blocks_left: -3,
+                ..
+            }
+        ));
+        assert_eq!(claims.len(), 1);
+    }
+
+    #[test]
+    fn missing_expiry_fields_never_resolve() {
+        let whole = htlc(&hash(), &secret(), 1000);
+        for (object, field) in [
+            ("htlc", "cltv_expiry"),
+            ("htlc", "cltv_expiry_relative"),
+            ("onion", "outgoing_cltv_value"),
+        ] {
+            let mut claims = one_claim(1000);
+            let mut v = whole.clone();
+            v[object].as_object_mut().expect("object").remove(field);
+            assert!(
+                matches!(
+                    try_claim(&mut claims, &v, MIN_BLOCKS),
+                    ClaimVerdict::ExpiresTooSoon { .. }
+                ),
+                "without {object}.{field}"
+            );
+            assert_eq!(claims.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unset_minimum_never_resolves() {
+        let mut claims = one_claim(1000);
+        let v = htlc(&hash(), &secret(), 1000);
+        assert!(matches!(
+            try_claim(&mut claims, &v, i64::MAX),
+            ClaimVerdict::ExpiresTooSoon { .. }
+        ));
+    }
+
+    #[test]
     fn wrong_secret_passes_and_the_claim_kept() {
         let mut claims = one_claim(1000);
         let v = htlc(&hash(), &"33".repeat(32), 1000);
-        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Pass
+        ));
         assert_eq!(claims.len(), 1);
     }
 
@@ -1322,7 +1503,10 @@ mod tests {
     fn unknown_hash_passes() {
         let mut claims = one_claim(1000);
         let v = htlc(&"bb".repeat(32), &secret(), 1000);
-        assert!(matches!(try_claim(&mut claims, &v), ClaimVerdict::Pass));
+        assert!(matches!(
+            try_claim(&mut claims, &v, MIN_BLOCKS),
+            ClaimVerdict::Pass
+        ));
     }
 
     #[test]
