@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 use crate::onion_error::{
     classify_fee_insufficient, failcode_name, parse_chan_update, ChanUpdate, FeeFault,
 };
-use crate::plan::{fee_ppm, PlanResult, PERSISTENT_LAYER};
+use crate::plan::{fee_ppm, inform_channel, Inform, PlanResult, PERSISTENT_LAYER};
 use crate::{eng, percent, Claim, State, XRebalanceParams, TOPIC_PART};
 
 /// waitsendpay's "Timed out" code: the HTLC is still in flight.
@@ -242,9 +242,9 @@ fn note_feedback(state: &State) {
 /// One best-effort inform-channel write into the persistent layer,
 /// coalesced: a bound already accepted this bucket and not tightened
 /// by this observation is dropped (coalesce.rs).
-async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: &str) {
-    let key = format!("{scidd}|{kind}");
-    let is_lower_bound = kind != "constrained";
+async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, kind: Inform) {
+    let key = format!("{scidd}|{}", kind.as_str());
+    let is_lower_bound = kind != Inform::Constrained;
     let Some(bucket) = state.coalescer.lock().expect("coalescer lock").check(
         &key,
         now_secs(),
@@ -253,18 +253,7 @@ async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, 
     ) else {
         return;
     };
-    match rpc
-        .call_raw::<Value, Value>(
-            "askrene-inform-channel",
-            &json!({
-                "layer": PERSISTENT_LAYER,
-                "short_channel_id_dir": scidd,
-                "amount_msat": amount_msat,
-                "inform": kind,
-            }),
-        )
-        .await
-    {
+    match inform_channel(rpc, state, PERSISTENT_LAYER, scidd, amount_msat, kind).await {
         Ok(_) => {
             state
                 .coalescer
@@ -273,7 +262,7 @@ async fn inform(state: &State, rpc: &mut ClnRpc, scidd: &str, amount_msat: u64, 
                 .record(&key, bucket, amount_msat);
             note_feedback(state);
         }
-        Err(e) => log::trace!("inform {kind} {scidd}: {e}"),
+        Err(e) => log::trace!("inform {} {scidd}: {e}", kind.as_str()),
     }
 }
 
@@ -330,7 +319,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                     &mut rpc,
                     &hop.scidd,
                     hop.amount_msat,
-                    "unconstrained",
+                    Inform::Unconstrained,
                 )
                 .await;
             }
@@ -375,7 +364,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                     &mut rpc,
                     &hop.scidd,
                     hop.amount_msat,
-                    "unconstrained",
+                    Inform::Unconstrained,
                 )
                 .await;
             }
@@ -420,7 +409,7 @@ async fn apply_feedback(state: &State, part: &Part, fail_data: Option<&Value>) {
                 // could not pass; a dead next-channel is excluded
                 // outright (1msat), aging out like any constraint.
                 let msat = if dead_next { 1 } else { erring.amount_msat };
-                inform(state, &mut rpc, &erring.scidd, msat, "constrained").await;
+                inform(state, &mut rpc, &erring.scidd, msat, Inform::Constrained).await;
             }
         }
     }
@@ -1074,6 +1063,7 @@ mod tests {
             coalescer: Arc::new(Mutex::new(crate::coalesce::Coalescer::new(6 * 60 * 60))),
             overrides: Arc::new(Mutex::new(crate::overrides::Overrides::new(3600))),
             self_id: Arc::new(OnceLock::new()),
+            constrain_channel: Arc::new(OnceLock::new()),
         }
     }
 

@@ -56,6 +56,16 @@ def test_xrebalance_flow(node_factory, bitcoind, plugin_opts):
                             dryrun=True)
     assert res['status'] == 'planned', res
     assert res['delivered_msat'] == 100000, res
+    # The plan wrote its bounds with askrene-constrain-channel where
+    # the node has that command, with askrene-inform-channel
+    # otherwise.
+    try:
+        l1.rpc.help('askrene-constrain-channel')
+        write_command = 'askrene-constrain-channel'
+    except RpcError:
+        write_command = 'askrene-inform-channel'
+    assert l1.daemon.is_in_log(
+        f'liquidity facts are written with {write_command}')
     # The fee is what the two network hops charge: l3 on l3 -> l1 for
     # the delivered amount, l2 on l2 -> l3 for what it forwards
     # (delivered plus l3's fee).  Our own policy on the first hop is

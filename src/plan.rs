@@ -342,6 +342,113 @@ async fn call(rpc: &mut ClnRpc, method: &str, params: Value) -> Result<Value, Er
         .map_err(|e| anyhow!("{method}: {e}"))
 }
 
+/// A liquidity fact about a channel direction, in the terms of
+/// askrene-inform-channel: `Constrained` at an amount that could not
+/// pass, `Unconstrained` at an amount the direction carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inform {
+    Constrained,
+    Unconstrained,
+}
+
+impl Inform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Inform::Constrained => "constrained",
+            Inform::Unconstrained => "unconstrained",
+        }
+    }
+}
+
+const CONSTRAIN_CHANNEL: &str = "askrene-constrain-channel";
+const INFORM_CHANNEL: &str = "askrene-inform-channel";
+/// JSON-RPC "method not found": lightningd's answer for a command it
+/// does not have.
+const METHOD_NOT_FOUND: i32 = -32601;
+
+/// The askrene call that writes one liquidity fact into a layer.
+/// Where the node has askrene-constrain-channel it is used, since
+/// askrene-inform-channel is deprecated there.  The two write the
+/// same constraint: the newer command takes the bound itself, the
+/// older one the amount that could not pass, one msat above the
+/// bound.  The older command also adds the direction's current
+/// askrene reservations to that amount and the newer one does not:
+/// while another caller's payment is pending on the direction, the
+/// bound written through the newer command is lower by that
+/// reservation.
+fn inform_request(
+    constrain_channel: bool,
+    layer: &str,
+    scidd: &str,
+    amount_msat: u64,
+    inform: Inform,
+) -> (&'static str, Value) {
+    if !constrain_channel {
+        return (
+            INFORM_CHANNEL,
+            json!({
+                "layer": layer,
+                "short_channel_id_dir": scidd,
+                "amount_msat": amount_msat,
+                "inform": inform.as_str(),
+            }),
+        );
+    }
+    let (bound_msat, upper) = match inform {
+        Inform::Constrained => (amount_msat.saturating_sub(1), true),
+        Inform::Unconstrained => (amount_msat, false),
+    };
+    (
+        CONSTRAIN_CHANNEL,
+        json!({
+            "layer": layer,
+            "short_channel_id_dir": scidd,
+            "amount_msat": bound_msat,
+            "upper": upper,
+        }),
+    )
+}
+
+/// Whether the node has askrene-constrain-channel.  Asked once: the
+/// plugin does not outlive the lightningd that answered.
+async fn has_constrain_channel(state: &State, rpc: &mut ClnRpc) -> Result<bool, Error> {
+    if let Some(known) = state.constrain_channel.get() {
+        return Ok(*known);
+    }
+    let known = match rpc
+        .call_raw::<Value, Value>("help", &json!({"command": CONSTRAIN_CHANNEL}))
+        .await
+    {
+        Ok(_) => true,
+        Err(e) if e.code == Some(METHOD_NOT_FOUND) => false,
+        Err(e) => return Err(anyhow!("help {CONSTRAIN_CHANNEL}: {e}")),
+    };
+    log::debug!(
+        "liquidity facts are written with {}",
+        if known {
+            CONSTRAIN_CHANNEL
+        } else {
+            INFORM_CHANNEL
+        }
+    );
+    let _ = state.constrain_channel.set(known);
+    Ok(known)
+}
+
+/// Write one liquidity fact about a channel direction into a layer.
+pub async fn inform_channel(
+    rpc: &mut ClnRpc,
+    state: &State,
+    layer: &str,
+    scidd: &str,
+    amount_msat: u64,
+    inform: Inform,
+) -> Result<Value, Error> {
+    let constrain_channel = has_constrain_channel(state, rpc).await?;
+    let (method, params) = inform_request(constrain_channel, layer, scidd, amount_msat, inform);
+    call(rpc, method, params).await
+}
+
 /// Run the planning pipeline.
 pub async fn plan(state: &State, params: &XRebalanceParams) -> Result<PlanResult, Error> {
     let mut rpc = ClnRpc::new(&state.rpc_path)
@@ -576,18 +683,7 @@ async fn apply_overrides(rpc: &mut ClnRpc, state: &State, layer: &str, req: &str
         }
     }
     for scidd in snap.exclusions {
-        if let Err(e) = call(
-            rpc,
-            "askrene-inform-channel",
-            json!({
-                "layer": layer,
-                "short_channel_id_dir": scidd,
-                "amount_msat": 1,
-                "inform": "constrained",
-            }),
-        )
-        .await
-        {
+        if let Err(e) = inform_channel(rpc, state, layer, &scidd, 1, Inform::Constrained).await {
             refused += 1;
             log::debug!("req {req}: override exclusion {scidd} not written: {e}");
         }
@@ -765,27 +861,23 @@ async fn plan_in_layer(
         let known_msat =
             receivable_msat.min(update["htlc_maximum_msat"].as_u64().unwrap_or(u64::MAX));
         if known_msat > 0 {
-            call(
+            inform_channel(
                 rpc,
-                "askrene-inform-channel",
-                json!({
-                    "layer": split,
-                    "short_channel_id_dir": mirror_scidd,
-                    "amount_msat": known_msat,
-                    "inform": "unconstrained",
-                }),
+                state,
+                split,
+                &mirror_scidd,
+                known_msat,
+                Inform::Unconstrained,
             )
             .await?;
         }
-        call(
+        inform_channel(
             rpc,
-            "askrene-inform-channel",
-            json!({
-                "layer": split,
-                "short_channel_id_dir": mirror_scidd,
-                "amount_msat": known_msat + 1,
-                "inform": "constrained",
-            }),
+            state,
+            split,
+            &mirror_scidd,
+            known_msat + 1,
+            Inform::Constrained,
         )
         .await?;
         unsplit.insert(mirror_scidd, real_scidd);
@@ -889,15 +981,13 @@ async fn plan_in_layer(
             if target >= sb.solver_max {
                 continue;
             }
-            call(
+            inform_channel(
                 rpc,
-                "askrene-inform-channel",
-                json!({
-                    "layer": split,
-                    "short_channel_id_dir": sb.scidd,
-                    "amount_msat": target + 1,
-                    "inform": "constrained",
-                }),
+                state,
+                split,
+                &sb.scidd,
+                target + 1,
+                Inform::Constrained,
             )
             .await?;
             sb.solver_max = target;
@@ -1260,11 +1350,58 @@ async fn plan_in_layer(
 #[cfg(test)]
 mod tests {
     use super::{
-        all_pruned_detail, fee_ppm, normalize_hops, part_within_length, part_within_probability,
-        part_within_rate, retries_liquidity_failures, retry_tolerance_msat, route_path, HtlcSlots,
+        all_pruned_detail, fee_ppm, inform_request, normalize_hops, part_within_length,
+        part_within_probability, part_within_rate, retries_liquidity_failures,
+        retry_tolerance_msat, route_path, HtlcSlots, Inform,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
+
+    // The older command takes the fact as the plugin states it.
+    #[test]
+    fn inform_request_older_command() {
+        assert_eq!(
+            inform_request(false, "l", "1x2x3/0", 5_001, Inform::Constrained),
+            (
+                "askrene-inform-channel",
+                json!({
+                    "layer": "l",
+                    "short_channel_id_dir": "1x2x3/0",
+                    "amount_msat": 5_001,
+                    "inform": "constrained",
+                }),
+            )
+        );
+        assert_eq!(
+            inform_request(false, "l", "1x2x3/0", 5_000, Inform::Unconstrained).1["inform"],
+            "unconstrained"
+        );
+    }
+
+    // The newer command takes the bound: an amount that could not
+    // pass bounds the direction one msat lower, and an exclusion
+    // (constrained at 1msat) bounds it at zero.
+    #[test]
+    fn inform_request_newer_command() {
+        assert_eq!(
+            inform_request(true, "l", "1x2x3/0", 5_001, Inform::Constrained),
+            (
+                "askrene-constrain-channel",
+                json!({
+                    "layer": "l",
+                    "short_channel_id_dir": "1x2x3/0",
+                    "amount_msat": 5_000,
+                    "upper": true,
+                }),
+            )
+        );
+        let exclusion = inform_request(true, "l", "1x2x3/0", 1, Inform::Constrained).1;
+        assert_eq!(exclusion["amount_msat"], 0);
+        assert_eq!(exclusion["upper"], true);
+        let carried = inform_request(true, "l", "1x2x3/0", 5_000, Inform::Unconstrained).1;
+        assert_eq!(carried["amount_msat"], 5_000);
+        assert_eq!(carried["upper"], false);
+    }
 
     // 230_502msat on 50_000_000msat = 4610.04ppm, truncated.
     #[test]
